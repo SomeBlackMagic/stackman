@@ -72,7 +72,7 @@ jobs:
           set -e
           mkdir -p artifacts
           REPO_LC="${GITHUB_REPOSITORY,,}"
-          TAG="${GITHUB_REF_NAME:-latest}"
+          TAG="${GITHUB_REF_NAME#v}"
 
           echo "Inspecting manifest for ghcr.io/${REPO_LC}:${TAG}"
 
