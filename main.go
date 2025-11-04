@@ -17,6 +17,11 @@ import (
 	"github.com/docker/docker/client"
 )
 
+var (
+	version  string = "dev"
+	revision string = "000000000000000000000000000000"
+)
+
 const (
 	waitInterval = 3 * time.Second
 	waitTimeout  = 5 * time.Minute
@@ -26,6 +31,8 @@ func main() {
 	if len(os.Args) < 3 {
 		log.Fatalf("usage: %s <stack-name> <compose-file>", os.Args[0])
 	}
+	log.Printf("Start Docker Stack Wait version=%s revision=%s", version, revision)
+
 	stack := os.Args[1]
 	file := os.Args[2]
 

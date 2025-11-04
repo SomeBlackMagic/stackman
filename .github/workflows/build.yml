@@ -69,16 +69,27 @@ jobs:
       - name: Export binaries from built images
         if: github.ref_type == 'tag'
         run: |
+          set -e
           mkdir -p artifacts
           REPO_LC="${GITHUB_REPOSITORY,,}"
+          TAG="${GITHUB_REF_NAME:-latest}"
+
+          echo "Inspecting manifest for ghcr.io/${REPO_LC}:${TAG}"
 
           for arch in amd64 arm64; do
-            DIGEST=$(docker buildx imagetools inspect "${{ env.REGISTRY }}/${REPO_LC}" \
-              | grep "linux/${arch}" -A1 | grep "digest:" | awk '{print $2}')
-            IMAGE="${{ env.REGISTRY }}/${REPO_LC}@${DIGEST}"
+            DIGEST=$(docker buildx imagetools inspect "ghcr.io/${REPO_LC}:${TAG}" \
+              --format "{{range .Manifest.Manifests}}{{if eq .Platform.Architecture \"${arch}\"}}{{.Digest}}{{end}}{{end}}")
 
+            if [ -z "$DIGEST" ]; then
+              echo "No digest found for ${arch}"
+              exit 1
+            fi
+
+            IMAGE="ghcr.io/${REPO_LC}@${DIGEST}"
+            echo "Pulling $IMAGE"
             docker pull "$IMAGE"
-            CID=$(docker create "$IMAGE" -c true)
+
+            CID=$(docker create "$IMAGE" true)
             docker cp "$CID:/usr/local/bin/docker-stackwait" "artifacts/docker-stackwait-${arch}-linux"
             docker rm "$CID"
 
