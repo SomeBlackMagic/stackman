@@ -30,12 +30,13 @@ const (
 )
 
 func main() {
-	showLogs := flag.Bool("logs", false, "Stream container logs during healthcheck")
-	registryAuthPath := flag.String("registry-auth-path", "", "Path to directory containing custom Docker config.json for registry authentication")
+	showLogs := flag.Bool("logs", false, "Stream logs during healthcheck")
+	logsMode := flag.String("logs-mode", "service", "Logs mode: container or service")
+	registryAuthPath := flag.String("registry-auth-path", "", "Path to Docker config directory for registry authentication")
 	flag.Parse()
 
 	if flag.NArg() < 2 {
-		log.Fatalf("usage: %s [--logs] [--registry-auth-path DIR] <stack-name> <compose-file>", os.Args[0])
+		log.Fatalf("usage: %s [--logs] [--logs-mode container|service] [--registry-auth-path DIR] <stack-name> <compose-file>", os.Args[0])
 	}
 
 	log.Printf("Start Docker Stack Wait version=%s revision=%s", version, revision)
@@ -77,10 +78,15 @@ func main() {
 	go streamStackEvents(ctx, cli, stack, &wg)
 
 	cmd.Wait()
-	fmt.Println("Stack deployment command finished. Monitoring containers...")
+	fmt.Println("Stack deployment finished. Monitoring containers...")
 
 	if *showLogs {
-		go streamContainerLogs(ctx, cli, stack)
+		switch *logsMode {
+		case "service":
+			go streamServiceLogs(ctx, stack)
+		default:
+			go streamContainerLogs(ctx, cli, stack)
+		}
 	}
 
 	success := waitForHealthy(ctx, cli, stack, waitTimeout)
@@ -130,6 +136,21 @@ func streamStackEvents(ctx context.Context, cli *client.Client, stack string, wg
 }
 
 // ---- Logs ----
+func streamServiceLogs(ctx context.Context, stack string) {
+	cmd := exec.Command("docker", "service", "logs", "-f", "--raw", stack)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		log.Printf("service logs start: %v", err)
+		return
+	}
+	go func() {
+		<-ctx.Done()
+		_ = cmd.Process.Kill()
+	}()
+	_ = cmd.Wait()
+}
+
 func streamContainerLogs(ctx context.Context, cli *client.Client, stack string) {
 	known := make(map[string]bool)
 
