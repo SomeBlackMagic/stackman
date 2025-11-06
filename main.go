@@ -15,6 +15,7 @@ import (
 	"stackwait/compose"
 	"stackwait/deployer"
 	"stackwait/monitor"
+	"stackwait/task"
 )
 
 // -----------------------------------
@@ -130,6 +131,36 @@ func main() {
 		}
 	}()
 
+	// [NEW] Start TaskWatcher BEFORE deployment to catch all task lifecycle events
+	// This runs in parallel with existing monitoring and doesn't affect current logic
+	taskWatcher := task.NewWatcher(cli, stackName)
+	taskEventChan := taskWatcher.Subscribe()
+
+	// Start TaskWatcher in background
+	go func() {
+		if err := taskWatcher.Start(ctx); err != nil && err != context.Canceled {
+			log.Printf("[TaskWatcher] Error: %v", err)
+		}
+	}()
+
+	// Start task event logger in background
+	go logTaskEvents(ctx, taskEventChan)
+
+	// Start periodic cleanup of old task states
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				taskWatcher.CleanupOldTasks(30 * time.Minute)
+			}
+		}
+	}()
+
 	// Start log streaming BEFORE deployment to catch all container events
 	logStreamer := monitor.NewLogStreamer(cli, stackName)
 	go logStreamer.StreamLogs(ctx)
@@ -144,11 +175,29 @@ func main() {
 
 	// Deploy stack
 	log.Printf("Deploying stack: %s", stackName)
-	if err := stackDeployer.Deploy(ctx, composeSpec); err != nil {
+	deployResult, err := stackDeployer.Deploy(ctx, composeSpec)
+	if err != nil {
 		log.Fatalf("failed to deploy stack: %v", err)
 	}
 
 	fmt.Println("Stack deployed successfully. Starting health checks...")
+
+	// Log which services were actually updated
+	if len(deployResult.UpdatedServices) > 0 {
+		//log.Printf("Services updated/created: %d", len(deployResult.UpdatedServices))
+		//for _, svc := range deployResult.UpdatedServices {
+		//	log.Printf("  - %s (version: %d)", svc.ServiceName, svc.Version.Index)
+		//}
+
+		// FUTURE: Here you can create dedicated TaskWatcher subscriptions for only updated services
+		// Example:
+		// for _, svc := range deployResult.UpdatedServices {
+		//     serviceEventsChan := taskWatcher.SubscribeToService(svc.ServiceID)
+		//     go monitorServiceTasks(ctx, svc, serviceEventsChan)
+		// }
+	} else {
+		log.Printf("No services were changed during this deployment")
+	}
 
 	// Wait for services to be ready
 	healthMonitor := monitor.NewHealthMonitor(cli, stackName, maxFailedTaskCount)
@@ -200,4 +249,79 @@ func rollback(ctx context.Context, stackDeployer *deployer.StackDeployer, snapsh
 	}
 
 	fmt.Println("Rollback completed successfully")
+}
+
+// logTaskEvents logs task lifecycle events from TaskWatcher
+// This function demonstrates the new task event system in action
+func logTaskEvents(ctx context.Context, eventChan <-chan task.Event) {
+	log.Println("[TaskWatcher] Started logging task events")
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[TaskWatcher] Stopped logging task events")
+			return
+
+		case event, ok := <-eventChan:
+			if !ok {
+				log.Println("[TaskWatcher] Event channel closed")
+				return
+			}
+
+			// Log event with color-coded prefix based on event type
+			prefix := getEventPrefix(event.Type)
+			shortTaskID := shortenID(event.TaskID)
+			shortContainerID := shortenID(event.ContainerID)
+
+			log.Printf("[TaskWatcher] %s Task: %s | Service: %s | Container: %s | %s",
+				prefix,
+				shortTaskID,
+				event.ServiceName,
+				shortContainerID,
+				event.Message,
+			)
+
+			// Log additional details for failure events
+			if event.IsFailure() && event.Error != nil {
+				log.Printf("[TaskWatcher]   └─ Error: %v", event.Error)
+			}
+
+			// Log state transitions
+			if event.State != "" && event.DesiredState != "" {
+				log.Printf("[TaskWatcher]   └─ State: %s → %s", event.State, event.DesiredState)
+			}
+		}
+	}
+}
+
+// getEventPrefix returns a visual prefix for different event types
+func getEventPrefix(eventType task.EventType) string {
+	switch eventType {
+	case task.EventTypeCreated:
+		return "🆕"
+	case task.EventTypeStarted:
+		return "▶️ "
+	case task.EventTypeRunning:
+		return "✅"
+	case task.EventTypeHealthy:
+		return "💚"
+	case task.EventTypeUnhealthy:
+		return "💔"
+	case task.EventTypeFailed:
+		return "❌"
+	case task.EventTypeCompleted:
+		return "🏁"
+	case task.EventTypeShutdown:
+		return "🛑"
+	default:
+		return "ℹ️ "
+	}
+}
+
+// shortenID shortens Docker IDs to first 12 characters for readability
+func shortenID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }

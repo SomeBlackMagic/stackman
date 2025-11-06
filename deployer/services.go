@@ -13,23 +13,33 @@ import (
 	"stackwait/compose"
 )
 
-func (d *StackDeployer) deployServices(ctx context.Context, services map[string]*compose.Service) error {
+func (d *StackDeployer) deployServices(ctx context.Context, services map[string]*compose.Service) (*DeploymentResult, error) {
+	result := &DeploymentResult{
+		UpdatedServices: make([]ServiceUpdateResult, 0, len(services)),
+	}
+
 	for name, svc := range services {
-		if err := d.deployService(ctx, name, svc); err != nil {
-			return fmt.Errorf("failed to deploy service %s: %w", name, err)
+		updateResult, err := d.deployService(ctx, name, svc)
+		if err != nil {
+			return nil, fmt.Errorf("failed to deploy service %s: %w", name, err)
+		}
+
+		// Only add to results if service was actually changed
+		if updateResult != nil && updateResult.Changed {
+			result.UpdatedServices = append(result.UpdatedServices, *updateResult)
 		}
 	}
 
-	return nil
+	return result, nil
 }
 
-func (d *StackDeployer) deployService(ctx context.Context, serviceName string, service *compose.Service) error {
+func (d *StackDeployer) deployService(ctx context.Context, serviceName string, service *compose.Service) (*ServiceUpdateResult, error) {
 	fullName := fmt.Sprintf("%s_%s", d.stackName, serviceName)
 
 	// Convert compose service to swarm spec
 	spec, err := compose.ConvertToSwarmSpec(serviceName, service, d.stackName)
 	if err != nil {
-		return fmt.Errorf("failed to convert service spec: %w", err)
+		return nil, fmt.Errorf("failed to convert service spec: %w", err)
 	}
 
 	// Attach to default network if no networks specified
@@ -52,7 +62,7 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 	})
 
 	if err != nil {
-		return fmt.Errorf("failed to list services: %w", err)
+		return nil, fmt.Errorf("failed to list services: %w", err)
 	}
 
 	if len(existingServices) > 0 {
@@ -82,10 +92,10 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 			}
 		}
 		if err != nil {
-			return fmt.Errorf("failed to list old tasks: %w", err)
+			return nil, fmt.Errorf("failed to list old tasks: %w", err)
 		}
 
-		_, err = d.cli.ServiceUpdate(
+		response, err := d.cli.ServiceUpdate(
 			ctx,
 			existing.ID,
 			existing.Version,
@@ -95,7 +105,7 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 			},
 		)
 		if err != nil {
-			return fmt.Errorf("failed to update service: %w", err)
+			return nil, fmt.Errorf("failed to update service: %w", err)
 		}
 
 		// Wait a bit for Docker to process the update
@@ -122,7 +132,7 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 			}
 		}
 		if err != nil {
-			return fmt.Errorf("failed to list new tasks: %w", err)
+			return nil, fmt.Errorf("failed to list new tasks: %w", err)
 		}
 
 		// Build map of old task IDs
@@ -144,26 +154,57 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 			log.Printf("Service %s updated, waiting for tasks to be recreated...", fullName)
 			// Wait for old tasks to be replaced with new ones
 			if err := d.waitForServiceUpdate(ctx, existing.ID, oldTasks); err != nil {
-				return fmt.Errorf("failed to wait for service update: %w", err)
+				return nil, fmt.Errorf("failed to wait for service update: %w", err)
 			}
 			log.Printf("Service %s update completed", fullName)
+
+			// Get updated service to retrieve new version
+			updatedService, _, err := d.cli.ServiceInspectWithRaw(ctx, existing.ID, types.ServiceInspectOptions{})
+			if err != nil {
+				return nil, fmt.Errorf("failed to inspect updated service: %w", err)
+			}
+
+			// Return update result - service was changed
+			return &ServiceUpdateResult{
+				ServiceID:   existing.ID,
+				ServiceName: fullName,
+				Version:     updatedService.Version,
+				Warnings:    response.Warnings,
+				Changed:     true,
+			}, nil
 		} else {
 			log.Printf("Service %s: no changes detected (tasks not recreated)", fullName)
+
+			// Return nil - service was NOT changed
+			return nil, nil
 		}
 	} else {
 		// Create new service
 		log.Printf("Creating service: %s", fullName)
 
-		_, err = d.cli.ServiceCreate(ctx, *spec, types.ServiceCreateOptions{
+		createResponse, err := d.cli.ServiceCreate(ctx, *spec, types.ServiceCreateOptions{
 			EncodedRegistryAuth: registryAuth,
 		})
 		if err != nil {
-			return fmt.Errorf("failed to create service: %w", err)
+			return nil, fmt.Errorf("failed to create service: %w", err)
 		}
 		log.Printf("Service %s created", fullName)
-	}
 
-	return nil
+		// Get created service to retrieve version
+		createdService, _, err := d.cli.ServiceInspectWithRaw(ctx, createResponse.ID, types.ServiceInspectOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect created service: %w", err)
+		}
+
+		// Return create result - service was created (changed)
+		return &ServiceUpdateResult{
+			ServiceID:   createResponse.ID,
+			ServiceName: fullName,
+			Version:     createdService.Version,
+			Warnings:    createResponse.Warnings,
+			Changed:     true,
+		}, nil
+	}
 }
 
 // GetStackServices returns all services in the stack
