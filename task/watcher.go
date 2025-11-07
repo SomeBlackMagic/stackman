@@ -20,6 +20,10 @@ type Watcher struct {
 	client    client.APIClient
 	stackName string
 
+	// Optional: filter by specific service and version
+	filterServiceID string
+	filterVersion   uint64
+
 	// eventChan broadcasts task events to subscribers
 	eventChan chan Event
 
@@ -52,7 +56,7 @@ type taskState struct {
 	lastSeen     time.Time
 }
 
-// NewWatcher creates a new task event watcher
+// NewWatcher creates a new task event watcher for entire stack
 func NewWatcher(client client.APIClient, stackName string) *Watcher {
 	return &Watcher{
 		client:       client,
@@ -62,6 +66,22 @@ func NewWatcher(client client.APIClient, stackName string) *Watcher {
 		taskStates:   make(map[string]*taskState),
 		serviceNames: make(map[string]string),
 		done:         make(chan struct{}),
+	}
+}
+
+// NewServiceWatcher creates a task watcher filtered for specific service and version
+// Only tasks with version >= minVersion for this serviceID will emit events
+func NewServiceWatcher(client client.APIClient, stackName string, serviceID string, minVersion uint64) *Watcher {
+	return &Watcher{
+		client:          client,
+		stackName:       stackName,
+		filterServiceID: serviceID,
+		filterVersion:   minVersion,
+		eventChan:       make(chan Event, 100),
+		subscribers:     make([]chan Event, 0),
+		taskStates:      make(map[string]*taskState),
+		serviceNames:    make(map[string]string),
+		done:            make(chan struct{}),
 	}
 }
 
@@ -138,10 +158,10 @@ func (w *Watcher) Unsubscribe(ch <-chan Event) {
 // handleDockerEvent processes Docker events and converts them to task events
 func (w *Watcher) handleDockerEvent(ctx context.Context, dockerEvent events.Message) {
 	// Debug: log all events for this stack
-	if w.belongsToStack(dockerEvent) {
-		log.Printf("[TaskWatcher] DEBUG: Received event Type=%s Action=%s Actor.ID=%s",
-			dockerEvent.Type, dockerEvent.Action, dockerEvent.Actor.ID[:12])
-	}
+	//if w.belongsToStack(dockerEvent) {
+	//	log.Printf("[TaskWatcher] DEBUG: Received event Type=%s Action=%s Actor.ID=%s",
+	//		dockerEvent.Type, dockerEvent.Action, dockerEvent.Actor.ID[:12])
+	//}
 
 	// Filter by stack name
 	if !w.belongsToStack(dockerEvent) {
@@ -248,6 +268,31 @@ func (w *Watcher) handleContainerEvent(ctx context.Context, dockerEvent events.M
 	nodeID := dockerEvent.Actor.Attributes["com.docker.swarm.node.id"]
 	containerID := dockerEvent.Actor.ID
 
+	// If watcher is filtered for specific service, check it
+	if w.filterServiceID != "" && serviceID != w.filterServiceID {
+		return // Not our service
+	}
+
+	// If watcher is filtered by version, check task version
+	if w.filterVersion > 0 {
+		task, err := w.InspectTask(ctx, taskID)
+		if err != nil {
+			// Can't get task info, skip
+			return
+		}
+
+		// Only process tasks >= filterVersion
+		if task.Version.Index < w.filterVersion {
+			return
+		}
+
+		// Log only once per task (on create event)
+		if dockerEvent.Action == "create" {
+			log.Printf("[TaskWatcher] Processing task %s (version %d >= %d)",
+				taskID[:12], task.Version.Index, w.filterVersion)
+		}
+	}
+
 	// Update or create task state
 	w.taskStatesMu.Lock()
 	state, exists := w.taskStates[taskID]
@@ -293,13 +338,20 @@ func (w *Watcher) handleContainerEvent(ctx context.Context, dockerEvent events.M
 		eventType = EventTypeShutdown
 		message = "Task is being shut down"
 
-	case "health_status: healthy":
-		eventType = EventTypeHealthy
-		message = "Container is healthy"
-
-	case "health_status: unhealthy":
-		eventType = EventTypeUnhealthy
-		message = "Container is unhealthy"
+	case "health_status":
+		// Check health status from attributes
+		healthStatus := dockerEvent.Actor.Attributes["health_status"]
+		switch healthStatus {
+		case "healthy":
+			eventType = EventTypeHealthy
+			message = "Container is healthy"
+		case "unhealthy":
+			eventType = EventTypeUnhealthy
+			message = "Container is unhealthy"
+		default:
+			// Unknown health status, ignore
+			return
+		}
 
 	case "destroy":
 		// Container was removed - task is fully terminated

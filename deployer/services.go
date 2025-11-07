@@ -151,12 +151,7 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 		}
 
 		if hasNewTasks {
-			log.Printf("Service %s updated, waiting for tasks to be recreated...", fullName)
-			// Wait for old tasks to be replaced with new ones
-			if err := d.waitForServiceUpdate(ctx, existing.ID, oldTasks); err != nil {
-				return nil, fmt.Errorf("failed to wait for service update: %w", err)
-			}
-			log.Printf("Service %s update completed", fullName)
+			log.Printf("Service %s updated, new tasks will be created", fullName)
 
 			// Get updated service to retrieve new version
 			updatedService, _, err := d.cli.ServiceInspectWithRaw(ctx, existing.ID, types.ServiceInspectOptions{})
@@ -164,7 +159,7 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 				return nil, fmt.Errorf("failed to inspect updated service: %w", err)
 			}
 
-			// Return update result - service was changed
+			// Return update result immediately - don't wait for tasks
 			return &ServiceUpdateResult{
 				ServiceID:   existing.ID,
 				ServiceName: fullName,

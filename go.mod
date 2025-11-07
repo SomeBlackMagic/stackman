@@ -1,4 +1,4 @@
-module stackwait
+module stackman
 
 go 1.24.0
 
