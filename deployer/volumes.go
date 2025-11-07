@@ -7,7 +7,7 @@ import (
 
 	"github.com/docker/docker/api/types/volume"
 
-	"stackwait/compose"
+	"stackman/compose"
 )
 
 func (d *StackDeployer) createVolumes(ctx context.Context, volumes map[string]*compose.Volume) error {

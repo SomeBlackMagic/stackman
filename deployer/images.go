@@ -14,7 +14,7 @@ import (
 	"github.com/docker/docker/api/types/registry"
 	"golang.org/x/net/context"
 
-	"stackwait/compose"
+	"stackman/compose"
 )
 
 func (d *StackDeployer) pullImages(ctx context.Context, services map[string]*compose.Service) error {

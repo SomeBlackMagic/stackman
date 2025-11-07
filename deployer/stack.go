@@ -7,7 +7,7 @@ import (
 
 	"github.com/docker/docker/api/types/swarm"
 
-	"stackwait/compose"
+	"stackman/compose"
 )
 
 type StackDeployer struct {

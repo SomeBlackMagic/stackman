@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"stackwait/deployer"
+	"stackman/deployer"
 )
 
 // createSnapshot creates a snapshot of current stack state before deployment

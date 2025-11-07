@@ -19,9 +19,9 @@ import (
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 
-	"stackwait/compose"
-	"stackwait/deployer"
-	"stackwait/monitor"
+	"stackman/compose"
+	"stackman/deployer"
+	"stackman/monitor"
 )
 
 // MockDockerClient реализует интерфейс Docker API для тестирования

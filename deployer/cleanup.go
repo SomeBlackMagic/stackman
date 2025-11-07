@@ -11,7 +11,7 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
 
-	"stackwait/compose"
+	"stackman/compose"
 )
 
 // removeObsoleteServices removes services that exist in the stack but not in the compose file
