@@ -32,6 +32,9 @@ type Monitor struct {
 	healthChecks int    // number of health checks performed
 	failedChecks int    // number of failed health checks
 
+	// Configuration
+	showLogs bool // whether to stream container logs
+
 	// Channels for coordination
 	eventChan chan Event    // receives events for this task
 	stopChan  chan struct{} // signals monitor to stop
@@ -48,6 +51,11 @@ type Monitor struct {
 
 // NewMonitor creates a new task monitor
 func NewMonitor(client client.APIClient, taskID string, serviceID string, serviceName string) *Monitor {
+	return NewMonitorWithLogs(client, taskID, serviceID, serviceName, true)
+}
+
+// NewMonitorWithLogs creates a new task monitor with optional log streaming
+func NewMonitorWithLogs(client client.APIClient, taskID string, serviceID string, serviceName string, showLogs bool) *Monitor {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Monitor{
@@ -55,6 +63,7 @@ func NewMonitor(client client.APIClient, taskID string, serviceID string, servic
 		taskID:       taskID,
 		serviceID:    serviceID,
 		serviceName:  serviceName,
+		showLogs:     showLogs,
 		eventChan:    make(chan Event, 10),
 		stopChan:     make(chan struct{}),
 		doneChan:     make(chan struct{}),
@@ -83,14 +92,16 @@ func (m *Monitor) Start(ctx context.Context) error {
 		m.monitorHealth(ctx)
 	}()
 
-	// Log streaming goroutine
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		log.Printf("[TaskMonitor] Log streaming goroutine started for task %s", m.shortTaskID())
-		m.streamLogs(ctx)
-		log.Printf("[TaskMonitor] Log streaming goroutine ended for task %s", m.shortTaskID())
-	}()
+	// Log streaming goroutine (only if enabled)
+	if m.showLogs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			log.Printf("[TaskMonitor] Log streaming goroutine started for task %s", m.shortTaskID())
+			m.streamLogs(ctx)
+			log.Printf("[TaskMonitor] Log streaming goroutine ended for task %s", m.shortTaskID())
+		}()
+	}
 
 	// Event processing goroutine
 	wg.Add(1)
@@ -274,10 +285,11 @@ func (m *Monitor) streamLogs(ctx context.Context) {
 		state := m.state
 		m.mu.RUnlock()
 
-		// Wait for both container ID and running state
-		// Docker event actions: "start" means container started, "die" means stopped
-		if containerID != "" && (state == "start" || state == "running" || state == "complete") {
-			log.Printf("[TaskLogs] Container %s for task %s is %s after %d attempts", containerID[:12], m.shortTaskID(), state, waitCount)
+		// Wait for both container ID and container to be created
+		// Task states: new, pending, assigned, accepted, preparing, starting, running, complete, shutdown, failed, rejected
+		// We can start reading logs once container exists, even if still starting
+		if containerID != "" {
+			log.Printf("[TaskLogs] Container %s for task %s is ready (state: %s) after %d attempts", containerID[:12], m.shortTaskID(), state, waitCount)
 			break
 		}
 

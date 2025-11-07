@@ -23,7 +23,7 @@ func CreateSnapshot(ctx context.Context, stackDeployer *swarm.StackDeployer) *sw
 
 // rollback restores the stack to a previous snapshot state
 func Rollback(ctx context.Context, stackDeployer *swarm.StackDeployer, snapshot *swarm.StackSnapshot) {
-	if snapshot == nil || len(snapshot.Services) == 0 {
+	if snapshot == nil {
 		log.Println("No snapshot available, cannot rollback")
 		return
 	}

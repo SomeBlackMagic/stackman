@@ -5,12 +5,6 @@ import (
 	"os"
 )
 
-// ExecuteRollback runs the rollback command (stub)
-func ExecuteRollback(args []string) {
-	fmt.Fprintln(os.Stderr, "rollback command not yet implemented")
-	os.Exit(1)
-}
-
 // ExecuteDiff runs the diff command (stub)
 func ExecuteDiff(args []string) {
 	fmt.Fprintln(os.Stderr, "diff command not yet implemented")

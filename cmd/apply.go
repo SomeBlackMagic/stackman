@@ -208,7 +208,7 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 			}(serviceWatcher, svc.ServiceName)
 
 			// Start monitor for this service
-			go monitorServiceTasks(ctx, cli, svc, serviceEventsChan)
+			go monitorServiceTasks(ctx, cli, svc, serviceEventsChan, opts.ShowLogs)
 
 			log.Printf("[TaskMonitor] Started watcher for service %s version %d+", svc.ServiceName, svc.Version.Index)
 		}
@@ -256,7 +256,7 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 }
 
 // monitorServiceTasks monitors task lifecycle events for a service and logs them
-func monitorServiceTasks(ctx context.Context, cli *client.Client, svc swarm.ServiceUpdateResult, eventChan <-chan health.Event) {
+func monitorServiceTasks(ctx context.Context, cli *client.Client, svc swarm.ServiceUpdateResult, eventChan <-chan health.Event, showLogs bool) {
 	log.Printf("[ServiceMonitor] Started monitoring service: %s (version: %d)", svc.ServiceName, svc.Version.Index)
 
 	// Track active task monitors
@@ -295,7 +295,7 @@ func monitorServiceTasks(ctx context.Context, cli *client.Client, svc swarm.Serv
 				log.Printf("[ServiceMonitor] New task detected: %s for service %s",
 					taskID[:12], svc.ServiceName)
 
-				monitor = health.NewMonitor(cli, taskID, svc.ServiceID, svc.ServiceName)
+				monitor = health.NewMonitorWithLogs(cli, taskID, svc.ServiceID, svc.ServiceName, showLogs)
 				taskMonitors[taskID] = monitor
 
 				// Start monitor in background

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/swarm"
@@ -35,6 +36,11 @@ type Watcher struct {
 	taskStates   map[string]*taskState
 	taskStatesMu sync.RWMutex
 
+	// existingTasks tracks tasks that existed before monitoring started
+	// We don't emit events for these to avoid noise from already-running containers
+	existingTasks   map[string]bool
+	existingTasksMu sync.RWMutex
+
 	// serviceNames maps service IDs to names
 	serviceNames   map[string]string
 	serviceNamesMu sync.RWMutex
@@ -59,13 +65,14 @@ type taskState struct {
 // NewWatcher creates a new task event watcher for entire stack
 func NewWatcher(client client.APIClient, stackName string) *Watcher {
 	return &Watcher{
-		client:       client,
-		stackName:    stackName,
-		eventChan:    make(chan Event, 100), // buffered to avoid blocking
-		subscribers:  make([]chan Event, 0),
-		taskStates:   make(map[string]*taskState),
-		serviceNames: make(map[string]string),
-		done:         make(chan struct{}),
+		client:        client,
+		stackName:     stackName,
+		eventChan:     make(chan Event, 100), // buffered to avoid blocking
+		subscribers:   make([]chan Event, 0),
+		taskStates:    make(map[string]*taskState),
+		existingTasks: make(map[string]bool),
+		serviceNames:  make(map[string]string),
+		done:          make(chan struct{}),
 	}
 }
 
@@ -80,6 +87,7 @@ func NewServiceWatcher(client client.APIClient, stackName string, serviceID stri
 		eventChan:       make(chan Event, 100),
 		subscribers:     make([]chan Event, 0),
 		taskStates:      make(map[string]*taskState),
+		existingTasks:   make(map[string]bool),
 		serviceNames:    make(map[string]string),
 		done:            make(chan struct{}),
 	}
@@ -93,8 +101,18 @@ func (w *Watcher) Start(ctx context.Context) error {
 		log.Printf("Warning: failed to load service names: %v", err)
 	}
 
+	// Scan and mark existing tasks before starting monitoring
+	// This prevents emitting events for already-running containers
+	if err := w.markExistingTasks(ctx); err != nil {
+		log.Printf("Warning: failed to scan existing tasks: %v", err)
+	}
+
 	// Start event broadcaster
 	go w.broadcastEvents(ctx)
+
+	// Start periodic task polling (in addition to events)
+	// This catches tasks that were created before we subscribed to events
+	go w.pollTasks(ctx)
 
 	// Subscribe to Docker events
 	// NOTE: Docker Swarm does NOT emit "task" type events through Events API
@@ -157,16 +175,15 @@ func (w *Watcher) Unsubscribe(ch <-chan Event) {
 
 // handleDockerEvent processes Docker events and converts them to task events
 func (w *Watcher) handleDockerEvent(ctx context.Context, dockerEvent events.Message) {
-	// Debug: log all events for this stack
-	//if w.belongsToStack(dockerEvent) {
-	//	log.Printf("[TaskWatcher] DEBUG: Received event Type=%s Action=%s Actor.ID=%s",
-	//		dockerEvent.Type, dockerEvent.Action, dockerEvent.Actor.ID[:12])
-	//}
-
 	// Filter by stack name
 	if !w.belongsToStack(dockerEvent) {
 		return
 	}
+
+	// Debug: log all events for this stack
+	log.Printf("[TaskWatcher] DEBUG: Received event Type=%s Action=%s Actor.ID=%s ServiceID=%s",
+		dockerEvent.Type, dockerEvent.Action, dockerEvent.Actor.ID[:min(12, len(dockerEvent.Actor.ID))],
+		dockerEvent.Actor.Attributes["com.docker.swarm.service.id"])
 
 	switch dockerEvent.Type {
 	case "task":
@@ -277,12 +294,15 @@ func (w *Watcher) handleContainerEvent(ctx context.Context, dockerEvent events.M
 	if w.filterVersion > 0 {
 		task, err := w.InspectTask(ctx, taskID)
 		if err != nil {
-			// Can't get task info, skip
+			// Can't get task info, log and skip
+			log.Printf("[TaskWatcher] WARNING: Failed to inspect task %s for version check: %v", taskID[:12], err)
 			return
 		}
 
 		// Only process tasks >= filterVersion
 		if task.Version.Index < w.filterVersion {
+			log.Printf("[TaskWatcher] Skipping task %s (version %d < %d)",
+				taskID[:12], task.Version.Index, w.filterVersion)
 			return
 		}
 
@@ -592,4 +612,157 @@ func (w *Watcher) SubscribeToService(serviceID string) <-chan Event {
 	}()
 
 	return filtered
+}
+
+// pollTasks periodically polls Task API to discover new tasks
+// This complements event-based monitoring by catching tasks created before subscription
+func (w *Watcher) pollTasks(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	log.Printf("[TaskWatcher] Started periodic task polling")
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[TaskWatcher] Task polling stopped")
+			return
+		case <-ticker.C:
+			w.discoverTasks(ctx)
+		}
+	}
+}
+
+// discoverTasks fetches tasks from Docker API and emits events for new ones
+func (w *Watcher) discoverTasks(ctx context.Context) {
+	// Build filter for tasks
+	filter := filters.NewArgs()
+	filter.Add("label", "com.docker.stack.namespace="+w.stackName)
+
+	// If watching specific service, filter by service ID
+	if w.filterServiceID != "" {
+		filter.Add("service", w.filterServiceID)
+	}
+
+	tasks, err := w.client.TaskList(ctx, types.TaskListOptions{
+		Filters: filter,
+	})
+	if err != nil {
+		log.Printf("[TaskWatcher] Warning: failed to poll tasks: %v", err)
+		return
+	}
+
+	for _, task := range tasks {
+		// Apply version filter if set
+		if w.filterVersion > 0 && task.Version.Index < w.filterVersion {
+			continue
+		}
+
+		// Skip existing tasks (those that existed before monitoring started)
+		w.existingTasksMu.RLock()
+		isExisting := w.existingTasks[task.ID]
+		w.existingTasksMu.RUnlock()
+
+		if isExisting {
+			continue
+		}
+
+		// Check if this is a new task
+		w.taskStatesMu.RLock()
+		_, exists := w.taskStates[task.ID]
+		w.taskStatesMu.RUnlock()
+
+		if !exists {
+			// New task discovered! Emit creation event
+			log.Printf("[TaskWatcher] Discovered new task via polling: %s (service: %s, version: %d, state: %s)",
+				task.ID[:12], task.ServiceID[:12], task.Version.Index, task.Status.State)
+
+			// Create task state
+			w.taskStatesMu.Lock()
+			w.taskStates[task.ID] = &taskState{
+				taskID:       task.ID,
+				serviceID:    task.ServiceID,
+				serviceName:  task.Spec.ContainerSpec.Labels["com.docker.swarm.service.name"],
+				containerID:  task.Status.ContainerStatus.ContainerID,
+				state:        string(task.Status.State),
+				desiredState: string(task.DesiredState),
+				lastSeen:     time.Now(),
+			}
+			w.taskStatesMu.Unlock()
+
+			// Emit created event
+			w.emitEvent(Event{
+				Type:        EventTypeCreated,
+				TaskID:      task.ID,
+				ServiceID:   task.ServiceID,
+				ServiceName: w.getServiceName(task.ServiceID),
+				ContainerID: task.Status.ContainerStatus.ContainerID,
+				State:       string(task.Status.State),
+				Message:     "Task discovered via polling",
+				Timestamp:   time.Now(),
+			})
+
+			// If task already has container ID, emit container info
+			if task.Status.ContainerStatus.ContainerID != "" {
+				w.emitEvent(Event{
+					Type:        EventTypeStarted,
+					TaskID:      task.ID,
+					ServiceID:   task.ServiceID,
+					ServiceName: w.getServiceName(task.ServiceID),
+					ContainerID: task.Status.ContainerStatus.ContainerID,
+					State:       string(task.Status.State),
+					Message:     fmt.Sprintf("Task in state: %s", task.Status.State),
+					Timestamp:   time.Now(),
+				})
+			}
+		}
+	}
+}
+
+// getServiceName retrieves service name from cache
+func (w *Watcher) getServiceName(serviceID string) string {
+	w.serviceNamesMu.RLock()
+	defer w.serviceNamesMu.RUnlock()
+
+	if name, ok := w.serviceNames[serviceID]; ok {
+		return name
+	}
+	return serviceID[:12] // fallback to short ID
+}
+
+// markExistingTasks scans and marks all currently running tasks
+// This prevents emitting events for tasks that existed before monitoring started
+func (w *Watcher) markExistingTasks(ctx context.Context) error {
+	// Scan existing containers and extract their task IDs
+	containerFilter := filters.NewArgs()
+	containerFilter.Add("label", "com.docker.stack.namespace="+w.stackName)
+
+	// If watching specific service, filter by service ID
+	if w.filterServiceID != "" {
+		containerFilter.Add("label", "com.docker.swarm.service.id="+w.filterServiceID)
+	}
+
+	containers, err := w.client.ContainerList(ctx, container.ListOptions{
+		All:     false, // Only running containers
+		Filters: containerFilter,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list existing containers: %w", err)
+	}
+
+	w.existingTasksMu.Lock()
+	defer w.existingTasksMu.Unlock()
+
+	// Mark task IDs from existing containers
+	for _, c := range containers {
+		taskID := c.Labels["com.docker.swarm.task.id"]
+		if taskID != "" {
+			w.existingTasks[taskID] = true
+			log.Printf("[TaskWatcher] Marked task %s as existing (container %s)",
+				taskID[:12], c.ID[:12])
+		}
+	}
+
+	log.Printf("[TaskWatcher] Marked %d existing task(s) to ignore their events", len(w.existingTasks))
+	return nil
 }
