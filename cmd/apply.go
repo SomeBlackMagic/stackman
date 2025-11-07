@@ -39,6 +39,7 @@ func ExecuteApply(args []string) {
 	prune := fs.Bool("prune", false, "Remove orphaned resources")
 	allowLatest := fs.Bool("allow-latest", false, "Allow 'latest' tag in images")
 	parallel := fs.Int("parallel", 1, "Number of parallel service updates")
+	showLogs := fs.Bool("logs", true, "Show container logs during deployment")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Usage: stackman apply -n <stack> -f <compose-file> [flags]
@@ -77,6 +78,7 @@ Flags:
 		Prune:           *prune,
 		AllowLatest:     *allowLatest,
 		Parallel:        *parallel,
+		ShowLogs:        *showLogs,
 	}); err != nil {
 		log.Fatalf("Apply failed: %v", err)
 	}
@@ -92,6 +94,7 @@ type ApplyOptions struct {
 	Prune           bool
 	AllowLatest     bool
 	Parallel        int
+	ShowLogs        bool
 }
 
 // runApply performs the actual deployment
@@ -168,6 +171,9 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 
 		// Start event-driven monitoring with watchers
 		log.Println("[TaskMonitor] Starting watchers and monitors for updated services...")
+		if opts.ShowLogs {
+			log.Println("[TaskMonitor] Container logs will be streamed below...")
+		}
 
 		var wg sync.WaitGroup
 		updateErrors := make(chan error, len(deployResult.UpdatedServices))

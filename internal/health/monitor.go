@@ -87,7 +87,9 @@ func (m *Monitor) Start(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		log.Printf("[TaskMonitor] Log streaming goroutine started for task %s", m.shortTaskID())
 		m.streamLogs(ctx)
+		log.Printf("[TaskMonitor] Log streaming goroutine ended for task %s", m.shortTaskID())
 	}()
 
 	// Event processing goroutine
@@ -170,6 +172,7 @@ func (m *Monitor) handleEvent(event Event) {
 
 	if event.ContainerID != "" && m.containerID == "" {
 		m.containerID = event.ContainerID
+		log.Printf("[TaskMonitor] Got container ID for task %s: %s", m.shortTaskID(), event.ContainerID[:12])
 	}
 
 	// Update health status
@@ -250,51 +253,68 @@ func (m *Monitor) checkHealth(ctx context.Context) {
 
 // streamLogs streams container logs for this task
 func (m *Monitor) streamLogs(ctx context.Context) {
-	// Wait for container ID to be available
+	log.Printf("[TaskLogs] Waiting for container ID for task %s...", m.shortTaskID())
+
+	// Wait for container ID to be available AND task to be running
+	waitCount := 0
+	var containerID string
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("[TaskLogs] Context done while waiting for container for task %s", m.shortTaskID())
 			return
 		case <-m.stopChan:
+			log.Printf("[TaskLogs] Stop signal while waiting for container for task %s", m.shortTaskID())
 			return
 		default:
 		}
 
 		m.mu.RLock()
-		containerID := m.containerID
+		containerID = m.containerID
+		state := m.state
 		m.mu.RUnlock()
 
-		if containerID != "" {
+		// Wait for both container ID and running state
+		// Docker event actions: "start" means container started, "die" means stopped
+		if containerID != "" && (state == "start" || state == "running" || state == "complete") {
+			log.Printf("[TaskLogs] Container %s for task %s is %s after %d attempts", containerID[:12], m.shortTaskID(), state, waitCount)
 			break
 		}
 
+		waitCount++
+		if waitCount%50 == 0 {
+			log.Printf("[TaskLogs] Still waiting for container to run for task %s (state: %s, waited %d iterations)", m.shortTaskID(), state, waitCount)
+		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	m.mu.RLock()
-	containerID := m.containerID
-	m.mu.RUnlock()
+	log.Printf("[TaskLogs] About to start streaming logs for %s/%s (container: %s)", m.serviceName, m.shortTaskID(), containerID[:12])
 
-	// Start streaming logs
+	// Start streaming logs - get ALL logs, not just from now
 	options := container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,
-		Timestamps: false,
-		Since:      time.Now().Format(time.RFC3339),
+		Timestamps: true,
+		// Don't use Since - get all logs from container start
 	}
 
 	logReader, err := m.client.ContainerLogs(ctx, containerID, options)
 	if err != nil {
-		log.Printf("[TaskMonitor] Failed to stream logs for task %s: %v", m.shortTaskID(), err)
+		log.Printf("[TaskLogs] Failed to stream logs for task %s: %v", m.shortTaskID(), err)
 		return
 	}
 	defer logReader.Close()
 
-	// Read logs until context cancelled or container stops
-	// Note: In production, you'd want to parse the logs properly
-	// For now, we just ensure the stream is active
-	buf := make([]byte, 1024)
+	log.Printf("[TaskLogs] Successfully opened log stream for %s/%s, starting to read...", m.serviceName, m.shortTaskID())
+
+	// Docker multiplexes stdout/stderr in a special format
+	// Header: [8]byte{STREAM_TYPE, 0, 0, 0, SIZE1, SIZE2, SIZE3, SIZE4}
+	// STREAM_TYPE: 0=stdin, 1=stdout, 2=stderr
+	// SIZE: uint32 big-endian, size of frame
+
+	buf := make([]byte, 8192)
+	logsReceived := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -304,10 +324,58 @@ func (m *Monitor) streamLogs(ctx context.Context) {
 		default:
 		}
 
-		_, err := logReader.Read(buf)
+		// Read header (8 bytes)
+		header := make([]byte, 8)
+		n, err := logReader.Read(header)
 		if err != nil {
-			// Log stream ended
+			if err.Error() != "EOF" && err.Error() != "context canceled" {
+				log.Printf("[TaskLogs] Log stream error for %s: %v", m.shortTaskID(), err)
+			}
 			return
+		}
+		if n != 8 {
+			if n > 0 {
+				log.Printf("[TaskLogs] Unexpected header size for %s: %d bytes", m.shortTaskID(), n)
+			}
+			continue
+		}
+
+		// Parse frame size from header
+		frameSize := uint32(header[4])<<24 | uint32(header[5])<<16 | uint32(header[6])<<8 | uint32(header[7])
+		if frameSize == 0 {
+			continue
+		}
+
+		// Read frame data
+		if frameSize > uint32(len(buf)) {
+			buf = make([]byte, frameSize)
+		}
+
+		n, err = logReader.Read(buf[:frameSize])
+		if err != nil {
+			return
+		}
+
+		// Output log line with service/task prefix
+		streamPrefix := "📄"
+		if header[0] == 1 {
+			streamPrefix = "📘" // stdout
+		} else if header[0] == 2 {
+			streamPrefix = "📕" // stderr
+		}
+
+		logLine := string(buf[:n])
+		logsReceived++
+
+		// Use fmt.Printf to output directly to stdout (not via logger)
+		fmt.Printf("%s [%s/%s] %s", streamPrefix, m.serviceName, m.shortTaskID(), logLine)
+		if len(logLine) > 0 && logLine[len(logLine)-1] != '\n' {
+			fmt.Println() // Add newline if not present
+		}
+
+		// Log every 10 lines to show we're receiving data
+		if logsReceived%10 == 1 {
+			log.Printf("[TaskLogs] Received %d log lines from %s/%s", logsReceived, m.serviceName, m.shortTaskID())
 		}
 	}
 }

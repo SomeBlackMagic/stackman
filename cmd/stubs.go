@@ -22,15 +22,3 @@ func ExecuteStatus(args []string) {
 	fmt.Fprintln(os.Stderr, "status command not yet implemented")
 	os.Exit(1)
 }
-
-// ExecuteLogs runs the logs command (stub)
-func ExecuteLogs(args []string) {
-	fmt.Fprintln(os.Stderr, "logs command not yet implemented")
-	os.Exit(1)
-}
-
-// ExecuteEvents runs the events command (stub)
-func ExecuteEvents(args []string) {
-	fmt.Fprintln(os.Stderr, "events command not yet implemented")
-	os.Exit(1)
-}
