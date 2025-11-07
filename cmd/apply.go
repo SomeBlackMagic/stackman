@@ -17,6 +17,7 @@ import (
 	"github.com/docker/docker/client"
 
 	"stackman/internal/compose"
+	"stackman/internal/deployment"
 	"stackman/internal/health"
 	"stackman/internal/snapshot"
 	"stackman/internal/swarm"
@@ -122,6 +123,10 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 
 	// TODO: Apply templating if valuesFile or setValues provided
 
+	// Generate deployment ID
+	deployID := deployment.GenerateDeployID()
+	log.Printf("[Deploy] Generated deployment ID: %s", deployID)
+
 	// Create deployer
 	stackDeployer := swarm.NewStackDeployer(cli, stackName, 3)
 
@@ -148,8 +153,8 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 	}()
 
 	// Deploy stack
-	log.Printf("Deploying stack: %s", stackName)
-	deployResult, err := stackDeployer.Deploy(ctx, composeSpec)
+	log.Printf("Deploying stack: %s (DeployID: %s)", stackName, deployID)
+	deployResult, err := stackDeployer.Deploy(ctx, composeSpec, deployID)
 	if err != nil {
 		return fmt.Errorf("failed to deploy stack: %w", err)
 	}
@@ -196,8 +201,8 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 				log.Printf("[ServiceUpdateMonitor] ✅ Service %s update completed successfully", s.ServiceName)
 			}(svc)
 
-			// Create dedicated watcher filtered for this service and version
-			serviceWatcher := health.NewServiceWatcher(cli, stackName, svc.ServiceID, svc.Version.Index)
+			// Create dedicated watcher filtered for this service, version and deployID
+			serviceWatcher := health.NewServiceWatcher(cli, stackName, svc.ServiceID, svc.Version.Index, deployResult.DeployID)
 			serviceEventsChan := serviceWatcher.Subscribe()
 
 			// Start watcher in background
@@ -208,9 +213,9 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 			}(serviceWatcher, svc.ServiceName)
 
 			// Start monitor for this service
-			go monitorServiceTasks(ctx, cli, svc, serviceEventsChan, opts.ShowLogs)
+			go monitorServiceTasks(ctx, cli, svc, serviceEventsChan, opts.ShowLogs, deployResult.DeployID)
 
-			log.Printf("[TaskMonitor] Started watcher for service %s version %d+", svc.ServiceName, svc.Version.Index)
+			log.Printf("[TaskMonitor] Started watcher for service %s version %d+ (deployID: %s)", svc.ServiceName, svc.Version.Index, deployResult.DeployID)
 		}
 
 		// Wait for all service updates to complete
@@ -238,7 +243,7 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 		defer healthCancel()
 
 		// Wait for all tasks to report healthy status
-		if err := waitForAllTasksHealthy(healthCtx, cli, stackName, deployResult.UpdatedServices); err != nil {
+		if err := waitForAllTasksHealthy(healthCtx, cli, stackName, deployResult.UpdatedServices, deployResult.DeployID); err != nil {
 			log.Printf("ERROR: %v", err)
 			snapshot.Rollback(ctx, stackDeployer, snap)
 			return err
@@ -256,8 +261,8 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 }
 
 // monitorServiceTasks monitors task lifecycle events for a service and logs them
-func monitorServiceTasks(ctx context.Context, cli *client.Client, svc swarm.ServiceUpdateResult, eventChan <-chan health.Event, showLogs bool) {
-	log.Printf("[ServiceMonitor] Started monitoring service: %s (version: %d)", svc.ServiceName, svc.Version.Index)
+func monitorServiceTasks(ctx context.Context, cli *client.Client, svc swarm.ServiceUpdateResult, eventChan <-chan health.Event, showLogs bool, deployID string) {
+	log.Printf("[ServiceMonitor] Started monitoring service: %s (version: %d, deployID: %s)", svc.ServiceName, svc.Version.Index, deployID)
 
 	// Track active task monitors
 	taskMonitors := make(map[string]*health.Monitor)
@@ -342,7 +347,7 @@ func monitorServiceTasks(ctx context.Context, cli *client.Client, svc swarm.Serv
 }
 
 // waitForAllTasksHealthy waits for all tasks of updated services to become healthy
-func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName string, updatedServices []swarm.ServiceUpdateResult) error {
+func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName string, updatedServices []swarm.ServiceUpdateResult, deployID string) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -360,11 +365,13 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 			unhealthyTasks := []string{}
 
 			for _, svc := range updatedServices {
-				// Get ALL tasks for this service (including failed/shutdown)
+				// Get ALL tasks for this service
+				// Note: Docker API does not support label filtering for tasks, only for containers
+				// So we get all tasks and filter manually
 				filter := filters.NewArgs()
 				filter.Add("service", svc.ServiceID)
 
-				tasks, err := cli.TaskList(ctx, types.TaskListOptions{
+				allTasks, err := cli.TaskList(ctx, types.TaskListOptions{
 					Filters: filter,
 				})
 				if err != nil {
@@ -373,14 +380,24 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 					continue
 				}
 
+				// Filter tasks by deployID from ContainerSpec labels
+				tasks := []dockerswarm.Task{}
+				for _, t := range allTasks {
+					if t.Spec.ContainerSpec != nil && t.Spec.ContainerSpec.Labels != nil {
+						if taskDeployID, ok := t.Spec.ContainerSpec.Labels["com.stackman.deploy.id"]; ok && taskDeployID == deployID {
+							tasks = append(tasks, t)
+						}
+					}
+				}
+
+				log.Printf("[HealthCheck] Service %s: found %d tasks with deployID %s (total tasks: %d)",
+					svc.ServiceName, len(tasks), deployID, len(allTasks))
+
 				healthyTaskCount := 0
 				hasRunningTask := false
 
 				for _, t := range tasks {
-					// Skip tasks from old versions
-					if t.Version.Index < svc.Version.Index {
-						continue
-					}
+					// deployID label guarantees correct tasks - no version check needed
 
 					// Log failed/shutdown tasks but don't fail immediately (Docker Swarm may restart)
 					if t.Status.State == dockerswarm.TaskStateFailed ||

@@ -13,13 +13,13 @@ import (
 	"stackman/internal/compose"
 )
 
-func (d *StackDeployer) deployServices(ctx context.Context, services map[string]*compose.Service) (*DeploymentResult, error) {
+func (d *StackDeployer) deployServices(ctx context.Context, services map[string]*compose.Service, deployID string) (*DeploymentResult, error) {
 	result := &DeploymentResult{
 		UpdatedServices: make([]ServiceUpdateResult, 0, len(services)),
 	}
 
 	for name, svc := range services {
-		updateResult, err := d.deployService(ctx, name, svc)
+		updateResult, err := d.deployService(ctx, name, svc, deployID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to deploy service %s: %w", name, err)
 		}
@@ -33,7 +33,7 @@ func (d *StackDeployer) deployServices(ctx context.Context, services map[string]
 	return result, nil
 }
 
-func (d *StackDeployer) deployService(ctx context.Context, serviceName string, service *compose.Service) (*ServiceUpdateResult, error) {
+func (d *StackDeployer) deployService(ctx context.Context, serviceName string, service *compose.Service, deployID string) (*ServiceUpdateResult, error) {
 	fullName := fmt.Sprintf("%s_%s", d.stackName, serviceName)
 
 	// Convert compose service to swarm spec
@@ -41,6 +41,24 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert service spec: %w", err)
 	}
+
+	// Initialize labels map if nil
+	if spec.Labels == nil {
+		spec.Labels = make(map[string]string)
+	}
+
+	// Add deployment ID label to service spec
+	spec.Labels["com.stackman.deploy.id"] = deployID
+
+	// IMPORTANT: Also add to container labels so tasks inherit it
+	// Docker Swarm does NOT copy service labels to tasks automatically
+	// We must add the label to TaskTemplate.ContainerSpec.Labels
+	if spec.TaskTemplate.ContainerSpec.Labels == nil {
+		spec.TaskTemplate.ContainerSpec.Labels = make(map[string]string)
+	}
+	spec.TaskTemplate.ContainerSpec.Labels["com.stackman.deploy.id"] = deployID
+
+	log.Printf("Service %s: adding deployment label (DeployID: %s)", fullName, deployID)
 
 	// Attach to default network if no networks specified
 	if service.Networks == nil {
@@ -69,6 +87,13 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 		// Update existing service
 		existing := existingServices[0]
 		log.Printf("Updating service: %s", fullName)
+
+		// Copy deployment ID from existing service if it exists
+		// This prevents unnecessary service updates when only deployment ID changes
+		if existingDeployID, ok := existing.Spec.Labels["com.stackman.deploy.id"]; ok {
+			spec.Labels["com.stackman.deploy.id"] = existingDeployID
+			spec.TaskTemplate.ContainerSpec.Labels["com.stackman.deploy.id"] = existingDeployID
+		}
 
 		// Get current tasks before update to track recreation
 		// Retry with exponential backoff for API timeouts
@@ -166,6 +191,7 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 				Version:     updatedService.Version,
 				Warnings:    response.Warnings,
 				Changed:     true,
+				DeployID:    deployID,
 			}, nil
 		} else {
 			log.Printf("Service %s: no changes detected (tasks not recreated)", fullName)
@@ -198,6 +224,7 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 			Version:     createdService.Version,
 			Warnings:    createResponse.Warnings,
 			Changed:     true,
+			DeployID:    deployID,
 		}, nil
 	}
 }

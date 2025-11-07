@@ -23,11 +23,13 @@ type ServiceUpdateResult struct {
 	Version     swarm.Version // Service version after update
 	Warnings    []string      // Any warnings from Docker API
 	Changed     bool          // Whether service was actually changed
+	DeployID    string        // Deployment ID for this deployment
 }
 
 // DeploymentResult contains information about all services deployed
 type DeploymentResult struct {
 	UpdatedServices []ServiceUpdateResult // Services that were created or updated
+	DeployID        string                // Deployment ID for this deployment
 }
 
 func NewStackDeployer(cli DockerClient, stackName string, maxFailedTaskCount int) *StackDeployer {
@@ -43,8 +45,8 @@ func NewStackDeployer(cli DockerClient, stackName string, maxFailedTaskCount int
 
 // Deploy deploys a complete stack from a compose file
 // Returns DeploymentResult with information about updated services, or error
-func (d *StackDeployer) Deploy(ctx context.Context, composeFile *compose.ComposeFile) (*DeploymentResult, error) {
-	log.Printf("Starting deployment of stack: %s", d.stackName)
+func (d *StackDeployer) Deploy(ctx context.Context, composeFile *compose.ComposeFile, deployID string) (*DeploymentResult, error) {
+	log.Printf("Starting deployment of stack: %s (DeployID: %s)", d.stackName, deployID)
 
 	// 1. Remove exited containers from previous deployments
 	if err := d.RemoveExitedContainers(ctx); err != nil {
@@ -72,11 +74,14 @@ func (d *StackDeployer) Deploy(ctx context.Context, composeFile *compose.Compose
 	}
 
 	// 6. Create/update services and collect results
-	result, err := d.deployServices(ctx, composeFile.Services)
+	result, err := d.deployServices(ctx, composeFile.Services, deployID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to deploy services: %w", err)
 	}
 
-	log.Printf("Stack %s deployed successfully", d.stackName)
+	// Set deployID in result
+	result.DeployID = deployID
+
+	log.Printf("Stack %s deployed successfully (DeployID: %s)", d.stackName, deployID)
 	return result, nil
 }

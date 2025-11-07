@@ -6,7 +6,6 @@ import (
 	"log"
 
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
@@ -135,57 +134,57 @@ func (d *StackDeployer) RemoveStack(ctx context.Context) error {
 
 // RemoveExitedContainers removes all exited containers from the stack
 func (d *StackDeployer) RemoveExitedContainers(ctx context.Context) error {
-	log.Printf("Removing exited containers from stack: %s", d.stackName)
-
-	// List all exited swarm task containers
-	containerFilters := filters.NewArgs(
-		filters.Arg("label", "com.docker.swarm.task"),
-		filters.Arg("status", "exited"),
-	)
-
-	containers, err := d.cli.ContainerList(ctx, container.ListOptions{
-		All:     true,
-		Filters: containerFilters,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to list exited containers: %w", err)
-	}
-
-	// Filter containers by stack name using service name prefix
-	var stackContainers []types.Container
-	stackPrefix := d.stackName + "_"
-	for _, cont := range containers {
-		if serviceName, ok := cont.Labels["com.docker.swarm.service.name"]; ok {
-			if len(serviceName) > len(stackPrefix) && serviceName[:len(stackPrefix)] == stackPrefix {
-				stackContainers = append(stackContainers, cont)
-			}
-		}
-	}
-
-	if len(stackContainers) == 0 {
-		log.Printf("No exited containers found for stack: %s", d.stackName)
-		return nil
-	}
-
-	log.Printf("Found %d exited container(s) to remove", len(stackContainers))
-
-	// Remove each exited container
-	for _, cont := range stackContainers {
-		containerName := cont.Names[0]
-		if len(containerName) > 0 && containerName[0] == '/' {
-			containerName = containerName[1:] // Remove leading slash
-		}
-
-		log.Printf("Removing exited container: %s (ID: %s)", containerName, cont.ID[:12])
-		if err := d.cli.ContainerRemove(ctx, cont.ID, container.RemoveOptions{
-			Force: true,
-		}); err != nil {
-			log.Printf("Warning: failed to remove container %s: %v", containerName, err)
-		} else {
-			log.Printf("Container %s removed successfully", containerName)
-		}
-	}
-
-	log.Printf("Finished removing exited containers from stack: %s", d.stackName)
+	//log.Printf("Removing exited containers from stack: %s", d.stackName)
+	//
+	//// List all exited swarm task containers
+	//containerFilters := filters.NewArgs(
+	//	filters.Arg("label", "com.docker.swarm.task"),
+	//	filters.Arg("status", "exited"),
+	//)
+	//
+	//containers, err := d.cli.ContainerList(ctx, container.ListOptions{
+	//	All:     true,
+	//	Filters: containerFilters,
+	//})
+	//if err != nil {
+	//	return fmt.Errorf("failed to list exited containers: %w", err)
+	//}
+	//
+	//// Filter containers by stack name using service name prefix
+	//var stackContainers []types.Container
+	//stackPrefix := d.stackName + "_"
+	//for _, cont := range containers {
+	//	if serviceName, ok := cont.Labels["com.docker.swarm.service.name"]; ok {
+	//		if len(serviceName) > len(stackPrefix) && serviceName[:len(stackPrefix)] == stackPrefix {
+	//			stackContainers = append(stackContainers, cont)
+	//		}
+	//	}
+	//}
+	//
+	//if len(stackContainers) == 0 {
+	//	log.Printf("No exited containers found for stack: %s", d.stackName)
+	//	return nil
+	//}
+	//
+	//log.Printf("Found %d exited container(s) to remove", len(stackContainers))
+	//
+	//// Remove each exited container
+	//for _, cont := range stackContainers {
+	//	containerName := cont.Names[0]
+	//	if len(containerName) > 0 && containerName[0] == '/' {
+	//		containerName = containerName[1:] // Remove leading slash
+	//	}
+	//
+	//	log.Printf("Removing exited container: %s (ID: %s)", containerName, cont.ID[:12])
+	//	if err := d.cli.ContainerRemove(ctx, cont.ID, container.RemoveOptions{
+	//		Force: true,
+	//	}); err != nil {
+	//		log.Printf("Warning: failed to remove container %s: %v", containerName, err)
+	//	} else {
+	//		log.Printf("Container %s removed successfully", containerName)
+	//	}
+	//}
+	//
+	//log.Printf("Finished removing exited containers from stack: %s", d.stackName)
 	return nil
 }

@@ -21,9 +21,10 @@ type Watcher struct {
 	client    client.APIClient
 	stackName string
 
-	// Optional: filter by specific service and version
+	// Optional: filter by specific service, version and deployID
 	filterServiceID string
 	filterVersion   uint64
+	filterDeployID  string
 
 	// eventChan broadcasts task events to subscribers
 	eventChan chan Event
@@ -76,14 +77,15 @@ func NewWatcher(client client.APIClient, stackName string) *Watcher {
 	}
 }
 
-// NewServiceWatcher creates a task watcher filtered for specific service and version
-// Only tasks with version >= minVersion for this serviceID will emit events
-func NewServiceWatcher(client client.APIClient, stackName string, serviceID string, minVersion uint64) *Watcher {
+// NewServiceWatcher creates a task watcher filtered for specific service, version and deployID
+// Only tasks with version >= minVersion AND matching deployID for this serviceID will emit events
+func NewServiceWatcher(client client.APIClient, stackName string, serviceID string, minVersion uint64, deployID string) *Watcher {
 	return &Watcher{
 		client:          client,
 		stackName:       stackName,
 		filterServiceID: serviceID,
 		filterVersion:   minVersion,
+		filterDeployID:  deployID,
 		eventChan:       make(chan Event, 100),
 		subscribers:     make([]chan Event, 0),
 		taskStates:      make(map[string]*taskState),
@@ -180,10 +182,10 @@ func (w *Watcher) handleDockerEvent(ctx context.Context, dockerEvent events.Mess
 		return
 	}
 
-	// Debug: log all events for this stack
-	log.Printf("[TaskWatcher] DEBUG: Received event Type=%s Action=%s Actor.ID=%s ServiceID=%s",
-		dockerEvent.Type, dockerEvent.Action, dockerEvent.Actor.ID[:min(12, len(dockerEvent.Actor.ID))],
-		dockerEvent.Actor.Attributes["com.docker.swarm.service.id"])
+	// TODO Debug: log all events for this stack
+	//log.Printf("[TaskWatcher] DEBUG: Received event Type=%s Action=%s Actor.ID=%s ServiceID=%s",
+	//	dockerEvent.Type, dockerEvent.Action, dockerEvent.Actor.ID[:min(12, len(dockerEvent.Actor.ID))],
+	//	dockerEvent.Actor.Attributes["com.docker.swarm.service.id"])
 
 	switch dockerEvent.Type {
 	case "task":
@@ -290,26 +292,40 @@ func (w *Watcher) handleContainerEvent(ctx context.Context, dockerEvent events.M
 		return // Not our service
 	}
 
-	// If watcher is filtered by version, check task version
-	if w.filterVersion > 0 {
+	// If watcher is filtered by version or deployID, check task
+	if w.filterVersion > 0 || w.filterDeployID != "" {
 		task, err := w.InspectTask(ctx, taskID)
 		if err != nil {
 			// Can't get task info, log and skip
-			log.Printf("[TaskWatcher] WARNING: Failed to inspect task %s for version check: %v", taskID[:12], err)
+			log.Printf("[TaskWatcher] WARNING: Failed to inspect task %s for version/deployID check: %v", taskID[:12], err)
 			return
 		}
 
-		// Only process tasks >= filterVersion
-		if task.Version.Index < w.filterVersion {
-			log.Printf("[TaskWatcher] Skipping task %s (version %d < %d)",
-				taskID[:12], task.Version.Index, w.filterVersion)
+		// Check version filter
+		if w.filterVersion > 0 && task.Version.Index < w.filterVersion {
+			// TODO Debug logs
+			//log.Printf("[TaskWatcher] Skipping task %s (version %d < %d)", taskID[:12], task.Version.Index, w.filterVersion)
 			return
+		}
+
+		// Check deployID filter
+		if w.filterDeployID != "" {
+			taskDeployID := ""
+			if task.Spec.ContainerSpec != nil && task.Spec.ContainerSpec.Labels != nil {
+				taskDeployID = task.Spec.ContainerSpec.Labels["com.stackman.deploy.id"]
+			}
+
+			if taskDeployID != w.filterDeployID {
+				// TODO Debug logs
+				//log.Printf("[TaskWatcher] Skipping task %s (deployID '%s' != '%s')", taskID[:12], taskDeployID, w.filterDeployID)
+				return
+			}
 		}
 
 		// Log only once per task (on create event)
 		if dockerEvent.Action == "create" {
-			log.Printf("[TaskWatcher] Processing task %s (version %d >= %d)",
-				taskID[:12], task.Version.Index, w.filterVersion)
+			log.Printf("[TaskWatcher] Processing task %s (version %d >= %d, deployID: %s)",
+				taskID[:12], task.Version.Index, w.filterVersion, w.filterDeployID)
 		}
 	}
 
@@ -658,6 +674,17 @@ func (w *Watcher) discoverTasks(ctx context.Context) {
 			continue
 		}
 
+		// Apply deployID filter if set
+		if w.filterDeployID != "" {
+			taskDeployID := ""
+			if task.Spec.ContainerSpec != nil && task.Spec.ContainerSpec.Labels != nil {
+				taskDeployID = task.Spec.ContainerSpec.Labels["com.stackman.deploy.id"]
+			}
+			if taskDeployID != w.filterDeployID {
+				continue
+			}
+		}
+
 		// Skip existing tasks (those that existed before monitoring started)
 		w.existingTasksMu.RLock()
 		isExisting := w.existingTasks[task.ID]
@@ -678,12 +705,17 @@ func (w *Watcher) discoverTasks(ctx context.Context) {
 				task.ID[:12], task.ServiceID[:12], task.Version.Index, task.Status.State)
 
 			// Create task state
+			containerID := ""
+			if task.Status.ContainerStatus != nil {
+				containerID = task.Status.ContainerStatus.ContainerID
+			}
+
 			w.taskStatesMu.Lock()
 			w.taskStates[task.ID] = &taskState{
 				taskID:       task.ID,
 				serviceID:    task.ServiceID,
 				serviceName:  task.Spec.ContainerSpec.Labels["com.docker.swarm.service.name"],
-				containerID:  task.Status.ContainerStatus.ContainerID,
+				containerID:  containerID,
 				state:        string(task.Status.State),
 				desiredState: string(task.DesiredState),
 				lastSeen:     time.Now(),
@@ -696,20 +728,20 @@ func (w *Watcher) discoverTasks(ctx context.Context) {
 				TaskID:      task.ID,
 				ServiceID:   task.ServiceID,
 				ServiceName: w.getServiceName(task.ServiceID),
-				ContainerID: task.Status.ContainerStatus.ContainerID,
+				ContainerID: containerID,
 				State:       string(task.Status.State),
 				Message:     "Task discovered via polling",
 				Timestamp:   time.Now(),
 			})
 
 			// If task already has container ID, emit container info
-			if task.Status.ContainerStatus.ContainerID != "" {
+			if containerID != "" {
 				w.emitEvent(Event{
 					Type:        EventTypeStarted,
 					TaskID:      task.ID,
 					ServiceID:   task.ServiceID,
 					ServiceName: w.getServiceName(task.ServiceID),
-					ContainerID: task.Status.ContainerStatus.ContainerID,
+					ContainerID: containerID,
 					State:       string(task.Status.State),
 					Message:     fmt.Sprintf("Task in state: %s", task.Status.State),
 					Timestamp:   time.Now(),

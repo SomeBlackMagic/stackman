@@ -307,7 +307,7 @@ func (m *Monitor) streamLogs(ctx context.Context) {
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,
-		Timestamps: true,
+		Timestamps: false,
 		// Don't use Since - get all logs from container start
 	}
 
@@ -387,7 +387,8 @@ func (m *Monitor) streamLogs(ctx context.Context) {
 
 		// Log every 10 lines to show we're receiving data
 		if logsReceived%10 == 1 {
-			log.Printf("[TaskLogs] Received %d log lines from %s/%s", logsReceived, m.serviceName, m.shortTaskID())
+			//TODO debug log
+			//log.Printf("[TaskLogs] Received %d log lines from %s/%s", logsReceived, m.serviceName, m.shortTaskID())
 		}
 	}
 }

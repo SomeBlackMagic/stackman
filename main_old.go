@@ -152,8 +152,6 @@ func main() {
 		log.Fatalf("failed to deploy stack: %v", err)
 	}
 
-	fmt.Println("Stack deployed successfully.")
-
 	// [STEP 2] Start TaskWatcher and TaskMonitors for EACH updated service
 	if len(deployResult.UpdatedServices) > 0 {
 		log.Printf("Services updated/created: %d", len(deployResult.UpdatedServices))

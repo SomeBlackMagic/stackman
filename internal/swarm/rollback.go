@@ -152,17 +152,34 @@ func (d *StackDeployer) Rollback(ctx context.Context, snapshot *StackSnapshot) e
 
 		log.Printf("Rolling back service: %s to version %d", serviceName, snap.Service.Version.Index)
 
-		// Update service to previous spec
+		// Restore service spec from snapshot
+		rollbackSpec := snap.Service.Spec
+
+		// Ensure update config for start-first behavior (seamless rollback)
+		if rollbackSpec.UpdateConfig == nil {
+			rollbackSpec.UpdateConfig = &swarm.UpdateConfig{}
+		}
+		// Set start-first order: new container starts before old one stops
+		rollbackSpec.UpdateConfig.Order = swarm.UpdateOrderStartFirst
+		// Set failure action to pause (safer for rollback)
+		rollbackSpec.UpdateConfig.FailureAction = swarm.UpdateFailureActionPause
+
+		// If update is paused, log it
+		if current.UpdateStatus != nil && current.UpdateStatus.State == swarm.UpdateStatePaused {
+			log.Printf("Service %s update is paused, will be cleared by rollback update", serviceName)
+		}
+
+		// Update service to previous spec from snapshot
 		_, err := d.cli.ServiceUpdate(
 			ctx,
 			serviceID,
-			current.Version, // Use current version for optimistic locking
-			snap.Service.Spec,
+			current.Version,
+			rollbackSpec,
 			types.ServiceUpdateOptions{
-				// Use rollback mode
 				RegistryAuthFrom: types.RegistryAuthFromPreviousSpec,
 			},
 		)
+
 		if err != nil {
 			log.Printf("Failed to rollback service %s: %v", serviceName, err)
 			return fmt.Errorf("rollback failed for service %s: %w", serviceName, err)
