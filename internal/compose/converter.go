@@ -2,7 +2,6 @@ package compose
 
 import (
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -11,6 +10,8 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/go-units"
+
+	"stackman/internal/paths"
 )
 
 // ConvertToSwarmSpec converts a compose service to Docker Swarm ServiceSpec
@@ -229,10 +230,10 @@ func convertCommand(cmd interface{}) ([]string, error) {
 func convertVolumes(volumes []interface{}) ([]mount.Mount, error) {
 	var mounts []mount.Mount
 
-	// Get current working directory for relative path resolution
-	cwd, err := os.Getwd()
+	// Create path resolver using SWARM_STACK_PATH or current directory
+	resolver, err := paths.NewResolver()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get working directory: %w", err)
+		return nil, fmt.Errorf("failed to create path resolver: %w", err)
 	}
 
 	for _, vol := range volumes {
@@ -246,20 +247,8 @@ func convertVolumes(volumes []interface{}) ([]mount.Mount, error) {
 			continue
 		}
 
-		source := parts[0]
-
-		// Convert relative paths to absolute paths
-		if strings.HasPrefix(source, "./") || strings.HasPrefix(source, "../") {
-			// Relative path - make it absolute
-			source = strings.Replace(source, "./", cwd+"/", 1)
-			if strings.HasPrefix(parts[0], "../") {
-				// For ../ paths, use filepath.Abs or join with cwd
-				source = cwd + "/" + parts[0]
-			}
-		} else if !strings.HasPrefix(source, "/") && !strings.Contains(source, "://") {
-			// If it doesn't start with /, it's relative (like "data/file.txt")
-			source = cwd + "/" + source
-		}
+		// Resolve source path using the path resolver
+		source := resolver.Resolve(parts[0])
 
 		m := mount.Mount{
 			Source: source,
