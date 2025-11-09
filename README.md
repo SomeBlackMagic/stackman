@@ -3,9 +3,15 @@
       <img src="https://cdn.jsdelivr.net/gh/SomeBlackMagic/stackman@master/docs/2bcf0cd7-f652-4fd9-9c67-ea1dc4515ca8.png" width="350" alt="Cilium Logo">
    </picture>
 
+
+
+![Build App](https://github.com/SomeBlackMagic/stackman/actions/workflows/build.yaml/badge.svg)
+[![codecov](https://codecov.io/gh/SomeBlackMagic/stackman/graph/badge.svg?token=Y64PUNF9KD)](https://codecov.io/gh/SomeBlackMagic/stackman)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL%203.0-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go)](go.mod)
 [![Docker](https://img.shields.io/badge/Docker-Swarm-2496ED?logo=docker)](https://docs.docker.com/engine/swarm/)
+[![Github Repo Size](https://img.shields.io/github/repo-size/SomeBlackMagic/stackman.svg)](https://github.com/SomeBlackMagic/stackman)
+![GitHub Release](https://img.shields.io/github/v/release/SomeBlackMagic/stackman)
 
 **stackman** - Docker Swarm stack orchestrator with health-aware deployment, intelligent rollback, and
 Helm-like workflow for Docker Swarm.
