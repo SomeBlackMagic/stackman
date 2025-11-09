@@ -65,8 +65,8 @@ func (d *StackDeployer) CreateSnapshot(ctx context.Context) (*StackSnapshot, err
 			Service: svc,
 			Tasks:   tasks,
 		}
-
-		log.Printf("Snapshotted service: %s (version %d)", svc.Spec.Name, svc.Version.Index)
+		// TODO Debug log
+		// log.Printf("Snapshotted service: %s (version %d)", svc.Spec.Name, svc.Version.Index)
 	}
 
 	log.Printf("Snapshot created with %d services", len(snapshot.Services))

@@ -44,21 +44,21 @@ func NewStackDeployer(cli DockerClient, stackName string, maxFailedTaskCount int
 // Deploy deploys a complete stack from a compose file
 // Returns DeploymentResult with information about updated services, or error
 func (d *StackDeployer) Deploy(ctx context.Context, composeFile *compose.ComposeFile) (*DeploymentResult, error) {
+	// 1. Pull images
+	if err := d.pullImages(ctx, composeFile.Services); err != nil {
+		return nil, fmt.Errorf("failed to pull images: %w", err)
+	}
+
 	log.Printf("Starting deployment of stack: %s", d.stackName)
 
-	// 1. Remove exited containers from previous deployments
+	// 2. Remove exited containers from previous deployments
 	if err := d.RemoveExitedContainers(ctx); err != nil {
 		return nil, fmt.Errorf("failed to remove exited containers: %w", err)
 	}
 
-	// 2. Check for obsolete services and remove them
+	// 3. Check for obsolete services and remove them
 	if err := d.removeObsoleteServices(ctx, composeFile.Services); err != nil {
 		return nil, fmt.Errorf("failed to remove obsolete services: %w", err)
-	}
-
-	// 3. Pull images
-	if err := d.pullImages(ctx, composeFile.Services); err != nil {
-		return nil, fmt.Errorf("failed to pull images: %w", err)
 	}
 
 	// 4. Create networks

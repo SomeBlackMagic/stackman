@@ -67,10 +67,3 @@ Use "stackman <command> --help" for more information about a command.
 `
 	fmt.Fprint(os.Stderr, usage)
 }
-
-func printVersion() {
-	// These will be set by build flags
-	version := "dev"
-	revision := "unknown"
-	fmt.Printf("stackman version %s (rev: %s)\n", version, revision)
-}

@@ -42,7 +42,8 @@ func (d *StackDeployer) removeObsoleteServices(ctx context.Context, services map
 	}
 
 	if len(servicesToRemove) == 0 {
-		log.Printf("No obsolete services to remove")
+		// TODO Debug logs
+		//log.Printf("No obsolete services to remove")
 		return nil
 	}
 
