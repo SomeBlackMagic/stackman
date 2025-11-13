@@ -124,7 +124,7 @@ jobs:
 
       - name: Upload build artifacts
         if: github.ref_type == 'tag'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: stackman-binaries
           path: artifacts/
