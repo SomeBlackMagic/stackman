@@ -41,8 +41,6 @@ type Monitor struct {
 	doneChan  chan struct{} // signals monitor has stopped
 
 	// Lifecycle management
-	ctx          context.Context
-	cancel       context.CancelFunc
 	shutdownOnce sync.Once
 	stopped      bool
 
@@ -57,8 +55,6 @@ func NewMonitor(client client.APIClient, taskID string, serviceID string, servic
 
 // NewMonitorWithLogs creates a new task monitor with optional log streaming
 func NewMonitorWithLogs(client client.APIClient, taskID string, serviceID string, serviceName string, showLogs bool) *Monitor {
-	ctx, cancel := context.WithCancel(context.Background())
-
 	return &Monitor{
 		client:       client,
 		taskID:       taskID,
@@ -68,8 +64,6 @@ func NewMonitorWithLogs(client client.APIClient, taskID string, serviceID string
 		eventChan:    make(chan Event, 10),
 		stopChan:     make(chan struct{}),
 		doneChan:     make(chan struct{}),
-		ctx:          ctx,
-		cancel:       cancel,
 		healthStatus: "unknown",
 		lastSeen:     time.Now(),
 	}
@@ -134,7 +128,6 @@ func (m *Monitor) Stop() {
 		m.stopped = true
 		m.mu.Unlock()
 		close(m.stopChan)
-		m.cancel()
 	})
 }
 
