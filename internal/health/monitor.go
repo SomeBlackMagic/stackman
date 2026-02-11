@@ -269,6 +269,12 @@ func (m *Monitor) checkHealth(ctx context.Context) {
 
 // streamLogs streams container logs for this task
 func (m *Monitor) streamLogs(ctx context.Context) {
+	// If Docker client is not initialized, skip log streaming
+	if m.client == nil {
+		log.Printf("[TaskLogs] Docker client is nil, skipping log streaming for task %s", m.shortTaskID())
+		return
+	}
+
 	log.Printf("[TaskLogs] Waiting for container ID for task %s...", m.shortTaskID())
 
 	// Wait for container ID to be available AND task to be running
