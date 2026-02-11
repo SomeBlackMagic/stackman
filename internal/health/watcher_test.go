@@ -51,20 +51,38 @@ func TestWatcher_Subscribe_Unsubscribe(t *testing.T) {
 		t.Errorf("Expected 1 subscriber after unsubscribe, got %d", len(watcher.subscribers))
 	}
 
-	// Verify channel is closed
-	_, ok := <-ch1
-	if ok {
-		t.Error("Expected unsubscribed channel to be closed")
+	// Note: Unsubscribe does NOT close the channel immediately to avoid race condition
+	// with broadcastEvents. The channel will be closed on watcher shutdown.
+	// We just verify that ch1 is removed from subscribers list.
+
+	// Verify ch1 is not in subscribers anymore
+	watcher.subscribersMu.RLock()
+	found := false
+	for _, sub := range watcher.subscribers {
+		if sub == ch1 {
+			found = true
+			break
+		}
+	}
+	watcher.subscribersMu.RUnlock()
+
+	if found {
+		t.Error("Expected ch1 to be removed from subscribers")
 	}
 
-	// ch2 should still be valid
-	select {
-	case _, ok := <-ch2:
-		if !ok {
-			t.Error("Expected ch2 to still be open")
+	// ch2 should still be in subscribers
+	watcher.subscribersMu.RLock()
+	found = false
+	for _, sub := range watcher.subscribers {
+		if sub == ch2 {
+			found = true
+			break
 		}
-	default:
-		// Channel is open and empty, which is correct
+	}
+	watcher.subscribersMu.RUnlock()
+
+	if !found {
+		t.Error("Expected ch2 to still be in subscribers")
 	}
 }
 
