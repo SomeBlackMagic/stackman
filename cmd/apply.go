@@ -151,7 +151,10 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 			os.Exit(0)
 		default:
 			log.Println("Deployment interrupted, initiating rollback...")
-			snapshot.Rollback(context.Background(), stackDeployer, snap)
+			// Create context with timeout for rollback to prevent hanging
+			rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer rollbackCancel()
+			snapshot.Rollback(rollbackCtx, stackDeployer, snap)
 			os.Exit(130)
 		}
 	}()
