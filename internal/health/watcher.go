@@ -162,13 +162,15 @@ func (w *Watcher) Subscribe() <-chan Event {
 }
 
 // Unsubscribe removes a subscriber channel
+// The channel will be closed automatically when the Watcher shuts down
 func (w *Watcher) Unsubscribe(ch <-chan Event) {
 	w.subscribersMu.Lock()
 	defer w.subscribersMu.Unlock()
 
 	for i, sub := range w.subscribers {
 		if sub == ch {
-			close(sub)
+			// Don't close here to avoid race condition with broadcastEvents
+			// The broadcaster will close all channels on shutdown
 			w.subscribers = append(w.subscribers[:i], w.subscribers[i+1:]...)
 			break
 		}
@@ -604,30 +606,52 @@ func (w *Watcher) GetTasksForService(serviceID string) []string {
 }
 
 // SubscribeToService creates a filtered channel that only receives events for a specific service
-func (w *Watcher) SubscribeToService(serviceID string) <-chan Event {
+// Returns the filtered channel and an unsubscribe function that MUST be called to stop the goroutine
+func (w *Watcher) SubscribeToService(serviceID string) (<-chan Event, func()) {
 	// Subscribe to all events
 	allEvents := w.Subscribe()
 
-	// Create filtered channel
+	// Create filtered channel and done signal
 	filtered := make(chan Event, 50)
+	done := make(chan struct{})
 
 	// Start filter goroutine
 	go func() {
 		defer close(filtered)
-		for event := range allEvents {
-			if event.ServiceID == serviceID {
-				select {
-				case filtered <- event:
-					// Event sent
-				default:
-					// Channel full, drop event
-					log.Printf("[TaskWatcher] WARNING: Filtered channel full for service %s", serviceID)
+		defer w.Unsubscribe(allEvents) // Clean up parent subscription
+
+		for {
+			select {
+			case <-done:
+				// Unsubscribe called, stop filtering
+				return
+			case event, ok := <-allEvents:
+				if !ok {
+					// Parent channel closed, stop filtering
+					return
+				}
+				if event.ServiceID == serviceID {
+					select {
+					case filtered <- event:
+						// Event sent
+					case <-done:
+						// Unsubscribe called during send
+						return
+					default:
+						// Channel full, drop event
+						log.Printf("[TaskWatcher] WARNING: Filtered channel full for service %s", serviceID)
+					}
 				}
 			}
 		}
 	}()
 
-	return filtered
+	// Return unsubscribe function that stops the filter goroutine
+	unsubscribe := func() {
+		close(done)
+	}
+
+	return filtered, unsubscribe
 }
 
 // pollTasks periodically polls Task API to discover new tasks
