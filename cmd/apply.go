@@ -354,12 +354,12 @@ func monitorServiceTasks(ctx context.Context, cli *client.Client, svc swarm.Serv
 }
 
 // waitForAllTasksHealthy waits for all tasks of updated services to become healthy
+// Optimized to use batch API calls instead of per-service calls
 func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName string, updatedServices []swarm.ServiceUpdateResult, deployID string) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	startTime := time.Now()
-	serviceHealthyCount := make(map[string]int)
 
 	for {
 		select {
@@ -370,62 +370,74 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 		case <-ticker.C:
 			allHealthy := true
 			unhealthyTasks := []string{}
+			serviceHealthyCount := make(map[string]int)
 
-			for _, svc := range updatedServices {
-				// Get current service by name to get updated service ID
-				// During updates, service ID remains the same but this ensures we have the latest service state
-				serviceFilter := filters.NewArgs()
-				serviceFilter.Add("name", svc.ServiceName)
-				services, err := cli.ServiceList(ctx, types.ServiceListOptions{
-					Filters: serviceFilter,
-				})
-				if err != nil {
-					log.Printf("[HealthCheck] Failed to get service %s: %v", svc.ServiceName, err)
-					allHealthy = false
-					continue
+			// OPTIMIZATION 1: Batch fetch all services in stack with one API call
+			serviceFilter := filters.NewArgs()
+			serviceFilter.Add("label", "com.docker.stack.namespace="+stackName)
+			allServices, err := cli.ServiceList(ctx, types.ServiceListOptions{
+				Filters: serviceFilter,
+			})
+			if err != nil {
+				log.Printf("[HealthCheck] Failed to list services: %v", err)
+				allHealthy = false
+				continue
+			}
+
+			// Create service name -> service map for quick lookup
+			serviceMap := make(map[string]dockerswarm.Service)
+			for _, svc := range allServices {
+				serviceMap[svc.Spec.Name] = svc
+			}
+
+			// OPTIMIZATION 2: Batch fetch all tasks in stack with one API call
+			taskFilter := filters.NewArgs()
+			taskFilter.Add("label", "com.docker.stack.namespace="+stackName)
+			allStackTasks, err := cli.TaskList(ctx, types.TaskListOptions{
+				Filters: taskFilter,
+			})
+			if err != nil {
+				log.Printf("[HealthCheck] Failed to list tasks: %v", err)
+				allHealthy = false
+				continue
+			}
+
+			// Group tasks by service name and filter by deployID
+			tasksByService := make(map[string][]dockerswarm.Task)
+			for _, task := range allStackTasks {
+				// Filter by deployID
+				if task.Spec.ContainerSpec != nil && task.Spec.ContainerSpec.Labels != nil {
+					if taskDeployID, ok := task.Spec.ContainerSpec.Labels["com.stackman.deploy.id"]; ok && taskDeployID == deployID {
+						serviceName := task.Spec.ContainerSpec.Labels["com.docker.swarm.service.name"]
+						tasksByService[serviceName] = append(tasksByService[serviceName], task)
+					}
 				}
-				if len(services) == 0 {
+			}
+
+			// OPTIMIZATION 3: Collect containers that need inspection
+			type containerTask struct {
+				containerID string
+				task        dockerswarm.Task
+				serviceName string
+			}
+			containersToInspect := []containerTask{}
+
+			// Process each updated service
+			for _, svc := range updatedServices {
+				_, exists := serviceMap[svc.ServiceName]
+				if !exists {
 					log.Printf("[HealthCheck] Service %s not found", svc.ServiceName)
 					allHealthy = false
 					continue
 				}
 
-				currentServiceID := services[0].ID
+				tasks := tasksByService[svc.ServiceName]
+				log.Printf("[HealthCheck] Service %s: found %d tasks with deployID %s",
+					svc.ServiceName, len(tasks), deployID)
 
-				// Get ALL tasks for this service
-				// Note: Docker API does not support label filtering for tasks, only for containers
-				// So we get all tasks and filter manually
-				filter := filters.NewArgs()
-				filter.Add("service", currentServiceID)
-
-				allTasks, err := cli.TaskList(ctx, types.TaskListOptions{
-					Filters: filter,
-				})
-				if err != nil {
-					log.Printf("[HealthCheck] Failed to list tasks for service %s: %v", svc.ServiceName, err)
-					allHealthy = false
-					continue
-				}
-
-				// Filter tasks by deployID from ContainerSpec labels
-				tasks := []dockerswarm.Task{}
-				for _, t := range allTasks {
-					if t.Spec.ContainerSpec != nil && t.Spec.ContainerSpec.Labels != nil {
-						if taskDeployID, ok := t.Spec.ContainerSpec.Labels["com.stackman.deploy.id"]; ok && taskDeployID == deployID {
-							tasks = append(tasks, t)
-						}
-					}
-				}
-
-				log.Printf("[HealthCheck] Service %s: found %d tasks with deployID %s (total tasks: %d)",
-					svc.ServiceName, len(tasks), deployID, len(allTasks))
-
-				healthyTaskCount := 0
 				hasRunningTask := false
 
 				for _, t := range tasks {
-					// deployID label guarantees correct tasks - no version check needed
-
 					// Log failed/shutdown tasks but don't fail immediately (Docker Swarm may restart)
 					if t.Status.State == dockerswarm.TaskStateFailed ||
 						t.Status.State == dockerswarm.TaskStateShutdown ||
@@ -450,47 +462,81 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 						continue
 					}
 
-					// Check container health if healthcheck is defined
+					// Mark container for inspection if it exists
 					if t.Status.ContainerStatus != nil && t.Status.ContainerStatus.ContainerID != "" {
-						containerInfo, err := cli.ContainerInspect(ctx, t.Status.ContainerStatus.ContainerID)
-						if err != nil {
-							log.Printf("[HealthCheck] Failed to inspect container %s for task %s (%s): %v",
-								t.Status.ContainerStatus.ContainerID[:12], t.ID[:12], svc.ServiceName, err)
-							allHealthy = false
-							unhealthyTasks = append(unhealthyTasks, fmt.Sprintf("%s/%s (inspect failed)", svc.ServiceName, t.ID[:12]))
-							continue
-						}
-
-						// If container has health check, wait for healthy status
-						if containerInfo.State.Health != nil {
-							if containerInfo.State.Health.Status != container.Healthy {
-								allHealthy = false
-								unhealthyTasks = append(unhealthyTasks, fmt.Sprintf("%s/%s (health: %s)", svc.ServiceName, t.ID[:12], containerInfo.State.Health.Status))
-								log.Printf("[HealthCheck] ⏳ Task %s (%s) is %s", t.ID[:12], svc.ServiceName, containerInfo.State.Health.Status)
-							} else {
-								log.Printf("[HealthCheck] ✅ Task %s (%s) is healthy", t.ID[:12], svc.ServiceName)
-								healthyTaskCount++
-							}
-						} else {
-							// No healthcheck defined, just check if running
-							log.Printf("[HealthCheck] ✅ Task %s (%s) is running (no healthcheck)", t.ID[:12], svc.ServiceName)
-							healthyTaskCount++
-						}
+						containersToInspect = append(containersToInspect, containerTask{
+							containerID: t.Status.ContainerStatus.ContainerID,
+							task:        t,
+							serviceName: svc.ServiceName,
+						})
 					} else {
-						// No container status yet
 						allHealthy = false
 						unhealthyTasks = append(unhealthyTasks, fmt.Sprintf("%s/%s (no container)", svc.ServiceName, t.ID[:12]))
 						log.Printf("[HealthCheck] ⏳ Task %s (%s) has no container yet", t.ID[:12], svc.ServiceName)
 					}
 				}
 
-				// Track if service has running tasks
 				if !hasRunningTask {
 					log.Printf("[HealthCheck] ⏳ Service %s has no running tasks yet (may be restarting)", svc.ServiceName)
 					allHealthy = false
 				}
+			}
 
-				serviceHealthyCount[svc.ServiceName] = healthyTaskCount
+			// OPTIMIZATION 4: Parallel container inspections with goroutines
+			type inspectResult struct {
+				ct   containerTask
+				info types.ContainerJSON
+				err  error
+			}
+
+			resultChan := make(chan inspectResult, len(containersToInspect))
+			var wg sync.WaitGroup
+
+			for _, ct := range containersToInspect {
+				wg.Add(1)
+				go func(c containerTask) {
+					defer wg.Done()
+					info, err := cli.ContainerInspect(ctx, c.containerID)
+					resultChan <- inspectResult{ct: c, info: info, err: err}
+				}(ct)
+			}
+
+			go func() {
+				wg.Wait()
+				close(resultChan)
+			}()
+
+			// Process inspection results
+			for result := range resultChan {
+				ct := result.ct
+				taskID := ct.task.ID
+				serviceName := ct.serviceName
+
+				if result.err != nil {
+					log.Printf("[HealthCheck] Failed to inspect container %s for task %s (%s): %v",
+						ct.containerID[:12], taskID[:12], serviceName, result.err)
+					allHealthy = false
+					unhealthyTasks = append(unhealthyTasks, fmt.Sprintf("%s/%s (inspect failed)", serviceName, taskID[:12]))
+					continue
+				}
+
+				// Check health status
+				if result.info.State.Health != nil {
+					if result.info.State.Health.Status != container.Healthy {
+						allHealthy = false
+						unhealthyTasks = append(unhealthyTasks, fmt.Sprintf("%s/%s (health: %s)",
+							serviceName, taskID[:12], result.info.State.Health.Status))
+						log.Printf("[HealthCheck] ⏳ Task %s (%s) is %s",
+							taskID[:12], serviceName, result.info.State.Health.Status)
+					} else {
+						log.Printf("[HealthCheck] ✅ Task %s (%s) is healthy", taskID[:12], serviceName)
+						serviceHealthyCount[serviceName]++
+					}
+				} else {
+					// No healthcheck defined, just check if running
+					log.Printf("[HealthCheck] ✅ Task %s (%s) is running (no healthcheck)", taskID[:12], serviceName)
+					serviceHealthyCount[serviceName]++
+				}
 			}
 
 			// Check that all services have at least one healthy task
