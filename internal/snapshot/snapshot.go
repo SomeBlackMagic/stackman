@@ -9,16 +9,16 @@ import (
 	"github.com/SomeBlackMagic/stackman/internal/swarm"
 )
 
-// createSnapshot creates a snapshot of current stack state before deployment
-func CreateSnapshot(ctx context.Context, stackDeployer *swarm.StackDeployer) *swarm.StackSnapshot {
+// CreateSnapshot creates a snapshot of current stack state before deployment
+// Returns error if snapshot creation fails to prevent deployment without rollback capability
+func CreateSnapshot(ctx context.Context, stackDeployer *swarm.StackDeployer) (*swarm.StackSnapshot, error) {
 	log.Println("Creating snapshot of current stack state...")
 	snapshot, err := stackDeployer.CreateSnapshot(ctx)
 	if err != nil {
-		log.Printf("Warning: failed to create snapshot: %v", err)
-		log.Println("Continuing without rollback capability")
-		return nil
+		return nil, fmt.Errorf("failed to create snapshot (rollback will not be available): %w", err)
 	}
-	return snapshot
+	log.Println("Snapshot created successfully")
+	return snapshot, nil
 }
 
 // rollback restores the stack to a previous snapshot state

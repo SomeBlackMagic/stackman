@@ -132,7 +132,10 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 	stackDeployer := swarm.NewStackDeployer(cli, stackName, 3)
 
 	// Create snapshot before deployment
-	snap := snapshot.CreateSnapshot(ctx, stackDeployer)
+	snap, err := snapshot.CreateSnapshot(ctx, stackDeployer)
+	if err != nil {
+		return fmt.Errorf("deployment blocked: %w", err)
+	}
 
 	// Track deployment state
 	deploymentComplete := make(chan bool, 1)
