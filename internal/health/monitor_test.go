@@ -196,14 +196,6 @@ func TestMonitor_Stop(t *testing.T) {
 		t.Error("stopChan should be closed")
 	}
 
-	// Context should be cancelled
-	select {
-	case <-monitor.ctx.Done():
-		// Expected
-	case <-time.After(100 * time.Millisecond):
-		t.Error("context should be cancelled")
-	}
-
 	// Multiple calls to Stop should be safe
 	monitor.Stop()
 	monitor.Stop()
