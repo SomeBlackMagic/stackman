@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -23,6 +24,9 @@ import (
 	"github.com/SomeBlackMagic/stackman/internal/snapshot"
 	"github.com/SomeBlackMagic/stackman/internal/swarm"
 )
+
+// errSignalInterrupted is returned when deployment is stopped by OS signal.
+var errSignalInterrupted = errors.New("deployment interrupted by signal")
 
 // ExecuteApply runs the apply command
 func ExecuteApply(args []string) {
@@ -82,6 +86,9 @@ Flags:
 		Parallel:        *parallel,
 		ShowLogs:        *showLogs,
 	}); err != nil {
+		if errors.Is(err, errSignalInterrupted) {
+			os.Exit(130)
+		}
 		log.Fatalf("Apply failed: %v", err)
 	}
 }
@@ -103,6 +110,15 @@ type ApplyOptions struct {
 func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout+5*time.Minute)
 	defer cancel()
+
+	// watcherWg tracks service watcher and task monitor goroutines.
+	// The deferred call cancels the context and waits for all goroutines to exit
+	// regardless of whether runApply returns normally or with an error.
+	var watcherWg sync.WaitGroup
+	defer func() {
+		cancel()
+		watcherWg.Wait()
+	}()
 
 	// Setup signal handling
 	sigChan := make(chan os.Signal, 1)
@@ -137,25 +153,36 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 		return fmt.Errorf("deployment blocked: %w", err)
 	}
 
-	// Track deployment state
-	deploymentComplete := make(chan bool, 1)
+	// deploymentComplete is closed when deployment finishes (success or no-wait).
+	// interrupted is closed when a signal triggers rollback.
+	deploymentComplete := make(chan struct{})
+	interrupted := make(chan struct{})
 
-	// Handle signals
+	// Handle signals: roll back and propagate cancellation instead of os.Exit,
+	// so deferred cleanups and goroutine waits run normally.
 	go func() {
-		sig := <-sigChan
-		log.Printf("Received signal: %v", sig)
-
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[Signal] PANIC in signal handler: %v", r)
+				cancel()
+			}
+		}()
 		select {
-		case <-deploymentComplete:
-			log.Println("Deployment already completed, exiting...")
-			os.Exit(0)
-		default:
-			log.Println("Deployment interrupted, initiating rollback...")
-			// Create context with timeout for rollback to prevent hanging
-			rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer rollbackCancel()
-			snapshot.Rollback(rollbackCtx, stackDeployer, snap)
-			os.Exit(130)
+		case sig := <-sigChan:
+			log.Printf("Received signal: %v", sig)
+			select {
+			case <-deploymentComplete:
+				log.Println("Deployment already completed")
+			default:
+				log.Println("Deployment interrupted, initiating rollback...")
+				rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				defer rollbackCancel()
+				snapshot.Rollback(rollbackCtx, stackDeployer, snap)
+				close(interrupted)
+			}
+			cancel() // stop all goroutines
+		case <-ctx.Done():
+			// Context expired naturally; nothing to do
 		}
 	}()
 
@@ -170,7 +197,7 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 
 	// If --no-wait, exit now
 	if opts.NoWait {
-		deploymentComplete <- true
+		close(deploymentComplete)
 		return nil
 	}
 
@@ -212,15 +239,31 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 			serviceWatcher := health.NewServiceWatcher(cli, stackName, svc.ServiceID, svc.Version.Index, deployResult.DeployID)
 			serviceEventsChan := serviceWatcher.Subscribe()
 
-			// Start watcher in background
+			// Start watcher in background — tracked by watcherWg
+			watcherWg.Add(1)
 			go func(w *health.Watcher, svcName string) {
+				defer watcherWg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[TaskWatcher] PANIC for service %s: %v", svcName, r)
+					}
+				}()
 				if err := w.Start(ctx); err != nil && err != context.Canceled {
 					log.Printf("[TaskWatcher] Error for service %s: %v", svcName, err)
 				}
 			}(serviceWatcher, svc.ServiceName)
 
-			// Start monitor for this service
-			go monitorServiceTasks(ctx, cli, svc, serviceEventsChan, opts.ShowLogs, deployResult.DeployID)
+			// Start monitor for this service — tracked by watcherWg
+			watcherWg.Add(1)
+			go func(s swarm.ServiceUpdateResult, evChan <-chan health.Event) {
+				defer watcherWg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[ServiceMonitor] PANIC for service %s: %v", s.ServiceName, r)
+					}
+				}()
+				monitorServiceTasks(ctx, cli, s, evChan, opts.ShowLogs, deployResult.DeployID)
+			}(svc, serviceEventsChan)
 
 			log.Printf("[TaskMonitor] Started watcher for service %s version %d+ (deployID: %s)", svc.ServiceName, svc.Version.Index, deployResult.DeployID)
 		}
@@ -261,10 +304,16 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 		log.Println("No services were changed during this deployment")
 	}
 
-	// Mark deployment as successful
-	deploymentComplete <- true
+	// Signal that deployment finished (used by the signal handler goroutine)
+	close(deploymentComplete)
 
-	return nil
+	// If a signal triggered rollback during deployment, propagate as error
+	select {
+	case <-interrupted:
+		return errSignalInterrupted
+	default:
+		return nil
+	}
 }
 
 // monitorServiceTasks monitors task lifecycle events for a service and logs them
@@ -312,6 +361,11 @@ func monitorServiceTasks(ctx context.Context, cli *client.Client, svc swarm.Serv
 
 				// Start monitor in background
 				go func(m *health.Monitor) {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("[ServiceMonitor] PANIC for task %s: %v", taskID[:12], r)
+						}
+					}()
 					if err := m.Start(ctx); err != nil && err != context.Canceled {
 						log.Printf("[ServiceMonitor] Monitor error for task %s: %v", taskID[:12], err)
 					}
@@ -482,13 +536,16 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 				}
 			}
 
-			// OPTIMIZATION 4: Parallel container inspections with goroutines
+			// OPTIMIZATION 4: Parallel container inspections with goroutines.
+			// A semaphore caps concurrency so we don't fan-out unboundedly.
 			type inspectResult struct {
 				ct   containerTask
 				info types.ContainerJSON
 				err  error
 			}
 
+			const maxParallelInspections = 10
+			sem := make(chan struct{}, maxParallelInspections)
 			resultChan := make(chan inspectResult, len(containersToInspect))
 			var wg sync.WaitGroup
 
@@ -496,6 +553,8 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 				wg.Add(1)
 				go func(c containerTask) {
 					defer wg.Done()
+					sem <- struct{}{}         // acquire semaphore slot
+					defer func() { <-sem }() // release on exit
 					info, err := cli.ContainerInspect(ctx, c.containerID)
 					resultChan <- inspectResult{ct: c, info: info, err: err}
 				}(ct)

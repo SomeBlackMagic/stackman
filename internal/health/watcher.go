@@ -109,12 +109,33 @@ func (w *Watcher) Start(ctx context.Context) error {
 		log.Printf("Warning: failed to scan existing tasks: %v", err)
 	}
 
+	// Track background goroutines so Start() waits for them before returning
+	var innerWg sync.WaitGroup
+
 	// Start event broadcaster
-	go w.broadcastEvents(ctx)
+	innerWg.Add(1)
+	go func() {
+		defer innerWg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[TaskWatcher] PANIC in broadcastEvents: %v", r)
+			}
+		}()
+		w.broadcastEvents(ctx)
+	}()
 
 	// Start periodic task polling (in addition to events)
 	// This catches tasks that were created before we subscribed to events
-	go w.pollTasks(ctx)
+	innerWg.Add(1)
+	go func() {
+		defer innerWg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[TaskWatcher] PANIC in pollTasks: %v", r)
+			}
+		}()
+		w.pollTasks(ctx)
+	}()
 
 	// Subscribe to Docker events
 	// NOTE: Docker Swarm does NOT emit "task" type events through Events API
@@ -129,24 +150,32 @@ func (w *Watcher) Start(ctx context.Context) error {
 
 	log.Printf("[TaskWatcher] Started watching events for stack: %s", w.stackName)
 
+	var returnErr error
+loop:
 	for {
 		select {
 		case <-ctx.Done():
 			log.Printf("[TaskWatcher] Context cancelled, stopping watcher")
 			w.shutdown()
-			return ctx.Err()
+			returnErr = ctx.Err()
+			break loop
 
 		case err := <-errChan:
 			if err != nil {
 				log.Printf("[TaskWatcher] Error receiving events: %v", err)
 				w.shutdown()
-				return err
+				returnErr = err
+				break loop
 			}
 
 		case dockerEvent := <-eventsChan:
 			w.handleDockerEvent(ctx, dockerEvent)
 		}
 	}
+
+	// Wait for background goroutines to finish before returning
+	innerWg.Wait()
+	return returnErr
 }
 
 // Subscribe returns a channel that receives task events
@@ -605,9 +634,10 @@ func (w *Watcher) GetTasksForService(serviceID string) []string {
 	return tasks
 }
 
-// SubscribeToService creates a filtered channel that only receives events for a specific service
-// Returns the filtered channel and an unsubscribe function that MUST be called to stop the goroutine
-func (w *Watcher) SubscribeToService(serviceID string) (<-chan Event, func()) {
+// SubscribeToService creates a filtered channel that only receives events for a specific service.
+// The goroutine stops when ctx is cancelled or unsubscribe() is called.
+// Returns the filtered channel and an unsubscribe function (safe to call multiple times).
+func (w *Watcher) SubscribeToService(ctx context.Context, serviceID string) (<-chan Event, func()) {
 	// Subscribe to all events
 	allEvents := w.Subscribe()
 
@@ -615,15 +645,21 @@ func (w *Watcher) SubscribeToService(serviceID string) (<-chan Event, func()) {
 	filtered := make(chan Event, 50)
 	done := make(chan struct{})
 
-	// Start filter goroutine
+	// Start filter goroutine — stopped by context cancellation OR unsubscribe()
 	go func() {
 		defer close(filtered)
 		defer w.Unsubscribe(allEvents) // Clean up parent subscription
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[TaskWatcher] PANIC in SubscribeToService filter: %v", r)
+			}
+		}()
 
 		for {
 			select {
 			case <-done:
-				// Unsubscribe called, stop filtering
+				return
+			case <-ctx.Done():
 				return
 			case event, ok := <-allEvents:
 				if !ok {
@@ -633,12 +669,11 @@ func (w *Watcher) SubscribeToService(serviceID string) (<-chan Event, func()) {
 				if event.ServiceID == serviceID {
 					select {
 					case filtered <- event:
-						// Event sent
 					case <-done:
-						// Unsubscribe called during send
+						return
+					case <-ctx.Done():
 						return
 					default:
-						// Channel full, drop event
 						log.Printf("[TaskWatcher] WARNING: Filtered channel full for service %s", serviceID)
 					}
 				}
@@ -646,9 +681,10 @@ func (w *Watcher) SubscribeToService(serviceID string) (<-chan Event, func()) {
 		}
 	}()
 
-	// Return unsubscribe function that stops the filter goroutine
+	// unsubscribe stops the filter goroutine; safe to call multiple times
+	var stopOnce sync.Once
 	unsubscribe := func() {
-		close(done)
+		stopOnce.Do(func() { close(done) })
 	}
 
 	return filtered, unsubscribe
