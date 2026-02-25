@@ -107,6 +107,7 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 	// Setup signal handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigChan)
 
 	// Initialize Docker client
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -141,23 +142,7 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 	deploymentComplete := make(chan bool, 1)
 
 	// Handle signals
-	go func() {
-		sig := <-sigChan
-		log.Printf("Received signal: %v", sig)
-
-		select {
-		case <-deploymentComplete:
-			log.Println("Deployment already completed, exiting...")
-			os.Exit(0)
-		default:
-			log.Println("Deployment interrupted, initiating rollback...")
-			// Create context with timeout for rollback to prevent hanging
-			rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer rollbackCancel()
-			snapshot.Rollback(rollbackCtx, stackDeployer, snap)
-			os.Exit(130)
-		}
-	}()
+	go runSignalHandler(sigChan, deploymentComplete, snap, stackDeployer, 5*time.Minute)
 
 	// Deploy stack
 	log.Printf("Deploying stack: %s (DeployID: %s)", stackName, deployID)
@@ -187,49 +172,31 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 			log.Println("[TaskMonitor] Container logs will be streamed below...")
 		}
 
+		// updateCtx is cancelled when runApply returns (defer), ensuring all monitoring
+		// goroutines stop promptly on early exit without waiting for the outer ctx timeout.
+		updateCtx, updateCancel := context.WithCancel(ctx)
+		defer updateCancel()
+
 		var wg sync.WaitGroup
 		updateErrors := make(chan error, len(deployResult.UpdatedServices))
 
 		for _, svc := range deployResult.UpdatedServices {
 			wg.Add(1)
-
-			// Start service update monitor for each service
-			go func(s swarm.ServiceUpdateResult) {
-				defer wg.Done()
-
-				// Monitor service update status
-				updateMonitor := health.NewServiceUpdateMonitor(cli, s.ServiceID, s.ServiceName)
-				if err := updateMonitor.WaitForUpdateComplete(ctx); err != nil {
-					log.Printf("[ServiceUpdateMonitor] ❌ Service %s update failed: %v", s.ServiceName, err)
-					updateErrors <- fmt.Errorf("service %s update failed: %w", s.ServiceName, err)
-					return
-				}
-
-				log.Printf("[ServiceUpdateMonitor] ✅ Service %s update completed successfully", s.ServiceName)
-			}(svc)
+			go runServiceUpdateMonitor(updateCtx, cli, svc, &wg, updateErrors)
 
 			// Create dedicated watcher filtered for this service, version and deployID
 			serviceWatcher := health.NewServiceWatcher(cli, stackName, svc.ServiceID, svc.Version.Index, deployResult.DeployID)
 			serviceEventsChan := serviceWatcher.Subscribe()
+			unsubscribe := func() { serviceWatcher.Unsubscribe(serviceEventsChan) }
 
-			// Start watcher in background
-			go func(w *health.Watcher, svcName string) {
-				if err := w.Start(ctx); err != nil && err != context.Canceled {
-					log.Printf("[TaskWatcher] Error for service %s: %v", svcName, err)
-				}
-			}(serviceWatcher, svc.ServiceName)
-
-			// Start monitor for this service
-			go monitorServiceTasks(ctx, cli, svc, serviceEventsChan, opts.ShowLogs, deployResult.DeployID)
+			go runServiceWatcher(updateCtx, serviceWatcher, svc.ServiceName)
+			go monitorServiceTasks(updateCtx, cli, svc, serviceEventsChan, unsubscribe, opts.ShowLogs, deployResult.DeployID)
 
 			log.Printf("[TaskMonitor] Started watcher for service %s version %d+ (deployID: %s)", svc.ServiceName, svc.Version.Index, deployResult.DeployID)
 		}
 
 		// Wait for all service updates to complete
-		go func() {
-			wg.Wait()
-			close(updateErrors)
-		}()
+		go closeOnWaitGroupDone(&wg, updateErrors)
 
 		// Check if any updates failed
 		for err := range updateErrors {
@@ -267,19 +234,20 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 	return nil
 }
 
-// monitorServiceTasks monitors task lifecycle events for a service and logs them
-func monitorServiceTasks(ctx context.Context, cli *client.Client, svc swarm.ServiceUpdateResult, eventChan <-chan health.Event, showLogs bool, deployID string) {
+// monitorServiceTasks monitors task lifecycle events for a service and logs them.
+// unsubscribe must be called to release the event channel subscription on exit.
+func monitorServiceTasks(ctx context.Context, cli *client.Client, svc swarm.ServiceUpdateResult, eventChan <-chan health.Event, unsubscribe func(), showLogs bool, deployID string) {
 	log.Printf("[ServiceMonitor] Started monitoring service: %s (version: %d, deployID: %s)", svc.ServiceName, svc.Version.Index, deployID)
 
 	// Track active task monitors
 	taskMonitors := make(map[string]*health.Monitor)
 	var mu sync.Mutex
 
-	// Create cleanup goroutine
 	defer func() {
+		unsubscribe()
 		mu.Lock()
 		for taskID, monitor := range taskMonitors {
-			log.Printf("[ServiceMonitor] Stopping monitor for task %s", taskID[:12])
+			log.Printf("[ServiceMonitor] Stopping monitor for task %s", shortTaskID(taskID))
 			monitor.Stop()
 		}
 		mu.Unlock()
@@ -305,23 +273,13 @@ func monitorServiceTasks(ctx context.Context, cli *client.Client, svc swarm.Serv
 			// Create new monitor for new tasks
 			if !exists && event.Type == health.EventTypeCreated {
 				log.Printf("[ServiceMonitor] New task detected: %s for service %s",
-					taskID[:12], svc.ServiceName)
+					shortTaskID(taskID), svc.ServiceName)
 
 				monitor = health.NewMonitorWithLogs(cli, taskID, svc.ServiceID, svc.ServiceName, showLogs)
 				taskMonitors[taskID] = monitor
 
 				// Start monitor in background
-				go func(m *health.Monitor) {
-					if err := m.Start(ctx); err != nil && err != context.Canceled {
-						log.Printf("[ServiceMonitor] Monitor error for task %s: %v", taskID[:12], err)
-					}
-
-					// Remove from registry when done
-					mu.Lock()
-					delete(taskMonitors, taskID)
-					mu.Unlock()
-					log.Printf("[ServiceMonitor] Task %s monitor finished", taskID[:12])
-				}(monitor)
+				go runTaskMonitorWorker(ctx, monitor, taskID, taskMonitors, &mu)
 			}
 
 			// Send event to existing monitor
@@ -335,19 +293,19 @@ func monitorServiceTasks(ctx context.Context, cli *client.Client, svc swarm.Serv
 			switch event.Type {
 			case health.EventTypeCreated:
 				log.Printf("[ServiceMonitor] 🆕 Service %s: Task %s created",
-					svc.ServiceName, taskID[:12])
+					svc.ServiceName, shortTaskID(taskID))
 			case health.EventTypeFailed:
 				log.Printf("[ServiceMonitor] ❌ Service %s: Task %s failed - %s",
-					svc.ServiceName, taskID[:12], event.Message)
+					svc.ServiceName, shortTaskID(taskID), event.Message)
 			case health.EventTypeHealthy:
 				log.Printf("[ServiceMonitor] 💚 Service %s: Task %s is healthy",
-					svc.ServiceName, taskID[:12])
+					svc.ServiceName, shortTaskID(taskID))
 			case health.EventTypeUnhealthy:
 				log.Printf("[ServiceMonitor] 💔 Service %s: Task %s is unhealthy - %s",
-					svc.ServiceName, taskID[:12], event.Message)
+					svc.ServiceName, shortTaskID(taskID), event.Message)
 			case health.EventTypeRunning:
 				log.Printf("[ServiceMonitor] ✅ Service %s: Task %s is running",
-					svc.ServiceName, taskID[:12])
+					svc.ServiceName, shortTaskID(taskID))
 			}
 		}
 	}
@@ -415,11 +373,6 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 			}
 
 			// OPTIMIZATION 3: Collect containers that need inspection
-			type containerTask struct {
-				containerID string
-				task        dockerswarm.Task
-				serviceName string
-			}
 			containersToInspect := []containerTask{}
 
 			// Process each updated service
@@ -483,28 +436,15 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 			}
 
 			// OPTIMIZATION 4: Parallel container inspections with goroutines
-			type inspectResult struct {
-				ct   containerTask
-				info types.ContainerJSON
-				err  error
-			}
-
 			resultChan := make(chan inspectResult, len(containersToInspect))
 			var wg sync.WaitGroup
 
 			for _, ct := range containersToInspect {
 				wg.Add(1)
-				go func(c containerTask) {
-					defer wg.Done()
-					info, err := cli.ContainerInspect(ctx, c.containerID)
-					resultChan <- inspectResult{ct: c, info: info, err: err}
-				}(ct)
+				go runContainerInspect(ctx, cli, ct, resultChan, &wg)
 			}
 
-			go func() {
-				wg.Wait()
-				close(resultChan)
-			}()
+			go closeOnWaitGroupDone(&wg, resultChan)
 
 			// Process inspection results
 			for result := range resultChan {
@@ -555,4 +495,92 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 			}
 		}
 	}
+}
+
+// containerTask associates a container ID with its task and service info for health inspection.
+type containerTask struct {
+	containerID string
+	task        dockerswarm.Task
+	serviceName string
+}
+
+// inspectResult holds the result of a single container inspection.
+type inspectResult struct {
+	ct   containerTask
+	info types.ContainerJSON
+	err  error
+}
+
+// runSignalHandler blocks until an OS signal is received, then either exits cleanly or
+// initiates a rollback and exits with code 130.
+func runSignalHandler(sigChan <-chan os.Signal, deploymentComplete <-chan bool, snap *swarm.StackSnapshot, deployer *swarm.StackDeployer, rollbackTimeout time.Duration) {
+	sig := <-sigChan
+	log.Printf("Received signal: %v", sig)
+
+	select {
+	case <-deploymentComplete:
+		log.Println("Deployment already completed, exiting...")
+		os.Exit(0)
+	default:
+		log.Println("Deployment interrupted, initiating rollback...")
+		rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), rollbackTimeout)
+		defer rollbackCancel()
+		snapshot.Rollback(rollbackCtx, deployer, snap)
+		os.Exit(130)
+	}
+}
+
+// runServiceUpdateMonitor waits for a service update to complete and sends any error to updateErrors.
+func runServiceUpdateMonitor(ctx context.Context, cli *client.Client, svc swarm.ServiceUpdateResult, wg *sync.WaitGroup, updateErrors chan<- error) {
+	defer wg.Done()
+
+	updateMonitor := health.NewServiceUpdateMonitor(cli, svc.ServiceID, svc.ServiceName)
+	if err := updateMonitor.WaitForUpdateComplete(ctx); err != nil {
+		log.Printf("[ServiceUpdateMonitor] ❌ Service %s update failed: %v", svc.ServiceName, err)
+		updateErrors <- fmt.Errorf("service %s update failed: %w", svc.ServiceName, err)
+		return
+	}
+
+	log.Printf("[ServiceUpdateMonitor] ✅ Service %s update completed successfully", svc.ServiceName)
+}
+
+// runServiceWatcher runs a service event watcher until ctx is cancelled.
+func runServiceWatcher(ctx context.Context, w *health.Watcher, svcName string) {
+	if err := w.Start(ctx); err != nil && err != context.Canceled {
+		log.Printf("[TaskWatcher] Error for service %s: %v", svcName, err)
+	}
+}
+
+// closeOnWaitGroupDone closes ch after wg.Wait() returns.
+func closeOnWaitGroupDone[T any](wg *sync.WaitGroup, ch chan T) {
+	wg.Wait()
+	close(ch)
+}
+
+// runTaskMonitorWorker starts a task monitor and removes it from the registry when done.
+func runTaskMonitorWorker(ctx context.Context, m *health.Monitor, taskID string, registry map[string]*health.Monitor, mu *sync.Mutex) {
+	if err := m.Start(ctx); err != nil && err != context.Canceled {
+		log.Printf("[ServiceMonitor] Monitor error for task %s: %v", shortTaskID(taskID), err)
+	}
+
+	mu.Lock()
+	delete(registry, taskID)
+	mu.Unlock()
+
+	log.Printf("[ServiceMonitor] Task %s monitor finished", shortTaskID(taskID))
+}
+
+// runContainerInspect inspects a single container and sends the result to resultChan.
+func runContainerInspect(ctx context.Context, cli *client.Client, ct containerTask, resultChan chan<- inspectResult, wg *sync.WaitGroup) {
+	defer wg.Done()
+	info, err := cli.ContainerInspect(ctx, ct.containerID)
+	resultChan <- inspectResult{ct: ct, info: info, err: err}
+}
+
+// shortTaskID returns a safe 12-character prefix of a Docker task ID for logging.
+func shortTaskID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }

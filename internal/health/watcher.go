@@ -299,7 +299,7 @@ func (w *Watcher) handleContainerEvent(ctx context.Context, dockerEvent events.M
 		task, err := w.InspectTask(ctx, taskID)
 		if err != nil {
 			// Can't get task info, log and skip
-			log.Printf("[TaskWatcher] WARNING: Failed to inspect task %s for version/deployID check: %v", taskID[:12], err)
+			log.Printf("[TaskWatcher] WARNING: Failed to inspect task %s for version/deployID check: %v", shortID(taskID), err)
 			return
 		}
 
@@ -327,7 +327,7 @@ func (w *Watcher) handleContainerEvent(ctx context.Context, dockerEvent events.M
 		// Log only once per task (on create event)
 		if dockerEvent.Action == "create" {
 			log.Printf("[TaskWatcher] Processing task %s (version %d >= %d, deployID: %s)",
-				taskID[:12], task.Version.Index, w.filterVersion, w.filterDeployID)
+				shortID(taskID), task.Version.Index, w.filterVersion, w.filterDeployID)
 		}
 	}
 
@@ -562,12 +562,14 @@ func (w *Watcher) CleanupOldTasks(maxAge time.Duration) int {
 	return removed
 }
 
-// shutdown performs graceful shutdown of the watcher
+// shutdown performs graceful shutdown of the watcher.
+// eventChan is intentionally not closed here: broadcastEvents exits via <-w.done,
+// and closing eventChan after done creates a race where broadcastEvents could read
+// a zero-value Event from the closed channel before seeing the done signal.
 func (w *Watcher) shutdown() {
 	w.shutdownOnce.Do(func() {
 		log.Printf("[TaskWatcher] Shutting down")
 		close(w.done)
-		close(w.eventChan)
 	})
 }
 
@@ -605,60 +607,59 @@ func (w *Watcher) GetTasksForService(serviceID string) []string {
 	return tasks
 }
 
-// SubscribeToService creates a filtered channel that only receives events for a specific service
-// Returns the filtered channel and an unsubscribe function that MUST be called to stop the goroutine
-func (w *Watcher) SubscribeToService(serviceID string) (<-chan Event, func()) {
-	// Subscribe to all events
+// SubscribeToService creates a filtered channel that only receives events for a specific service.
+// ctx controls the lifetime of the filter goroutine independently of the watcher lifetime.
+// Returns the filtered channel and an unsubscribe function that MUST be called to stop the goroutine.
+func (w *Watcher) SubscribeToService(ctx context.Context, serviceID string) (<-chan Event, func()) {
 	allEvents := w.Subscribe()
-
-	// Create filtered channel and done signal
 	filtered := make(chan Event, 50)
 	done := make(chan struct{})
 
-	// Start filter goroutine
-	go func() {
-		defer close(filtered)
-		defer w.Unsubscribe(allEvents) // Clean up parent subscription
+	go w.runServiceEventFilter(ctx, serviceID, allEvents, filtered, done)
 
-		for {
-			select {
-			case <-done:
-				// Unsubscribe called, stop filtering
+	return filtered, func() { close(done) }
+}
+
+// runServiceEventFilter forwards events matching serviceID from allEvents to filtered.
+// Exits when done is closed, ctx is cancelled, or allEvents is closed.
+func (w *Watcher) runServiceEventFilter(ctx context.Context, serviceID string, allEvents <-chan Event, filtered chan<- Event, done <-chan struct{}) {
+	defer close(filtered)
+	defer w.Unsubscribe(allEvents)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case event, ok := <-allEvents:
+			if !ok {
 				return
-			case event, ok := <-allEvents:
-				if !ok {
-					// Parent channel closed, stop filtering
+			}
+			if event.ServiceID == serviceID {
+				select {
+				case filtered <- event:
+				case <-ctx.Done():
 					return
-				}
-				if event.ServiceID == serviceID {
-					select {
-					case filtered <- event:
-						// Event sent
-					case <-done:
-						// Unsubscribe called during send
-						return
-					default:
-						// Channel full, drop event
-						log.Printf("[TaskWatcher] WARNING: Filtered channel full for service %s", serviceID)
-					}
+				case <-done:
+					return
+				default:
+					log.Printf("[TaskWatcher] WARNING: Filtered channel full for service %s", serviceID)
 				}
 			}
 		}
-	}()
-
-	// Return unsubscribe function that stops the filter goroutine
-	unsubscribe := func() {
-		close(done)
 	}
-
-	return filtered, unsubscribe
 }
 
-// pollTasks periodically polls Task API to discover new tasks
-// This complements event-based monitoring by catching tasks created before subscription
+// pollTasks periodically polls Task API to discover new tasks.
+// This complements event-based monitoring by catching tasks created before subscription.
+// It also runs periodic cleanup of stale taskStates entries to prevent unbounded growth.
 func (w *Watcher) pollTasks(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+	pollTicker := time.NewTicker(2 * time.Second)
+	defer pollTicker.Stop()
+
+	cleanupTicker := time.NewTicker(5 * time.Minute)
+	defer cleanupTicker.Stop()
 
 	log.Printf("[TaskWatcher] Started periodic task polling")
 
@@ -667,8 +668,10 @@ func (w *Watcher) pollTasks(ctx context.Context) {
 		case <-ctx.Done():
 			log.Printf("[TaskWatcher] Task polling stopped")
 			return
-		case <-ticker.C:
+		case <-pollTicker.C:
 			w.discoverTasks(ctx)
+		case <-cleanupTicker.C:
+			w.CleanupOldTasks(10 * time.Minute)
 		}
 	}
 }
@@ -709,12 +712,18 @@ func (w *Watcher) discoverTasks(ctx context.Context) {
 			}
 		}
 
-		// Skip existing tasks (those that existed before monitoring started)
+		// Skip existing tasks (those that existed before monitoring started).
+		// Remove terminal tasks from the map so it does not grow unboundedly.
 		w.existingTasksMu.RLock()
 		isExisting := w.existingTasks[task.ID]
 		w.existingTasksMu.RUnlock()
 
 		if isExisting {
+			if isTaskTerminal(task.Status.State) {
+				w.existingTasksMu.Lock()
+				delete(w.existingTasks, task.ID)
+				w.existingTasksMu.Unlock()
+			}
 			continue
 		}
 
@@ -726,7 +735,7 @@ func (w *Watcher) discoverTasks(ctx context.Context) {
 		if !exists {
 			// New task discovered! Emit creation event
 			log.Printf("[TaskWatcher] Discovered new task via polling: %s (service: %s, version: %d, state: %s)",
-				task.ID[:12], task.ServiceID[:12], task.Version.Index, task.Status.State)
+				shortID(task.ID), shortID(task.ServiceID), task.Version.Index, task.Status.State)
 
 			// Create task state
 			containerID := ""
@@ -734,11 +743,16 @@ func (w *Watcher) discoverTasks(ctx context.Context) {
 				containerID = task.Status.ContainerStatus.ContainerID
 			}
 
+			svcName := ""
+			if task.Spec.ContainerSpec != nil && task.Spec.ContainerSpec.Labels != nil {
+				svcName = task.Spec.ContainerSpec.Labels["com.docker.swarm.service.name"]
+			}
+
 			w.taskStatesMu.Lock()
 			w.taskStates[task.ID] = &taskState{
 				taskID:       task.ID,
 				serviceID:    task.ServiceID,
-				serviceName:  task.Spec.ContainerSpec.Labels["com.docker.swarm.service.name"],
+				serviceName:  svcName,
 				containerID:  containerID,
 				state:        string(task.Status.State),
 				desiredState: string(task.DesiredState),
@@ -783,7 +797,27 @@ func (w *Watcher) getServiceName(serviceID string) string {
 	if name, ok := w.serviceNames[serviceID]; ok {
 		return name
 	}
-	return serviceID[:12] // fallback to short ID
+	return shortID(serviceID)
+}
+
+// shortID returns a safe 12-character prefix of a Docker ID for logging.
+// Handles IDs shorter than 12 characters without panicking.
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
+// isTaskTerminal reports whether a task state is terminal,
+// meaning no further state transitions are expected.
+func isTaskTerminal(state swarm.TaskState) bool {
+	switch state {
+	case swarm.TaskStateComplete, swarm.TaskStateFailed,
+		swarm.TaskStateShutdown, swarm.TaskStateRejected:
+		return true
+	}
+	return false
 }
 
 // markExistingTasks scans and marks all currently running tasks
@@ -815,7 +849,7 @@ func (w *Watcher) markExistingTasks(ctx context.Context) error {
 		if taskID != "" {
 			w.existingTasks[taskID] = true
 			log.Printf("[TaskWatcher] Marked task %s as existing (container %s)",
-				taskID[:12], c.ID[:12])
+				shortID(taskID), shortID(c.ID))
 		}
 	}
 

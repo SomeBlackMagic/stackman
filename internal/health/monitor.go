@@ -2,7 +2,9 @@ package health
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -36,13 +38,15 @@ type Monitor struct {
 	showLogs bool // whether to stream container logs
 
 	// Channels for coordination
-	eventChan chan Event    // receives events for this task
-	stopChan  chan struct{} // signals monitor to stop
-	doneChan  chan struct{} // signals monitor has stopped
+	eventChan        chan Event    // receives events for this task
+	stopChan         chan struct{} // signals monitor to stop
+	doneChan         chan struct{} // signals monitor has stopped
+	containerReadyCh chan struct{} // closed when containerID is first set
 
 	// Lifecycle management
-	shutdownOnce sync.Once
-	stopped      bool
+	shutdownOnce  sync.Once
+	containerOnce sync.Once // ensures containerReadyCh is closed exactly once
+	stopped       bool
 
 	// Thread safety
 	mu sync.RWMutex
@@ -56,16 +60,17 @@ func NewMonitor(client client.APIClient, taskID string, serviceID string, servic
 // NewMonitorWithLogs creates a new task monitor with optional log streaming
 func NewMonitorWithLogs(client client.APIClient, taskID string, serviceID string, serviceName string, showLogs bool) *Monitor {
 	return &Monitor{
-		client:       client,
-		taskID:       taskID,
-		serviceID:    serviceID,
-		serviceName:  serviceName,
-		showLogs:     showLogs,
-		eventChan:    make(chan Event, 10),
-		stopChan:     make(chan struct{}),
-		doneChan:     make(chan struct{}),
-		healthStatus: "unknown",
-		lastSeen:     time.Now(),
+		client:           client,
+		taskID:           taskID,
+		serviceID:        serviceID,
+		serviceName:      serviceName,
+		showLogs:         showLogs,
+		eventChan:        make(chan Event, 10),
+		stopChan:         make(chan struct{}),
+		doneChan:         make(chan struct{}),
+		containerReadyCh: make(chan struct{}),
+		healthStatus:     "unknown",
+		lastSeen:         time.Now(),
 	}
 }
 
@@ -80,30 +85,16 @@ func (m *Monitor) Start(ctx context.Context) error {
 	// Start goroutines for different monitoring aspects
 	var wg sync.WaitGroup
 
-	// Health monitoring goroutine
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		m.monitorHealth(ctx)
-	}()
+	go m.runWorker(ctx, &wg, m.monitorHealth)
 
-	// Log streaming goroutine (only if enabled)
 	if m.showLogs {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			log.Printf("[TaskMonitor] Log streaming goroutine started for task %s", m.shortTaskID())
-			m.streamLogs(ctx)
-			log.Printf("[TaskMonitor] Log streaming goroutine ended for task %s", m.shortTaskID())
-		}()
+		go m.runWorker(ctx, &wg, m.runStreamLogs)
 	}
 
-	// Event processing goroutine
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		m.processEvents(ctx)
-	}()
+	go m.runWorker(ctx, &wg, m.processEvents)
 
 	// Wait for completion
 	select {
@@ -188,6 +179,7 @@ func (m *Monitor) handleEvent(event Event) {
 
 	if event.ContainerID != "" && m.containerID == "" {
 		m.containerID = event.ContainerID
+		m.containerOnce.Do(func() { close(m.containerReadyCh) })
 		log.Printf("[TaskMonitor] Got container ID for task %s: %s", m.shortTaskID(), event.ContainerID[:12])
 	}
 
@@ -277,39 +269,24 @@ func (m *Monitor) streamLogs(ctx context.Context) {
 
 	log.Printf("[TaskLogs] Waiting for container ID for task %s...", m.shortTaskID())
 
-	// Wait for container ID to be available AND task to be running
-	waitCount := 0
-	var containerID string
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("[TaskLogs] Context done while waiting for container for task %s", m.shortTaskID())
-			return
-		case <-m.stopChan:
-			log.Printf("[TaskLogs] Stop signal while waiting for container for task %s", m.shortTaskID())
-			return
-		default:
-		}
-
-		m.mu.RLock()
-		containerID = m.containerID
-		state := m.state
-		m.mu.RUnlock()
-
-		// Wait for both container ID and container to be created
-		// Task states: new, pending, assigned, accepted, preparing, starting, running, complete, shutdown, failed, rejected
-		// We can start reading logs once container exists, even if still starting
-		if containerID != "" {
-			log.Printf("[TaskLogs] Container %s for task %s is ready (state: %s) after %d attempts", containerID[:12], m.shortTaskID(), state, waitCount)
-			break
-		}
-
-		waitCount++
-		if waitCount%50 == 0 {
-			log.Printf("[TaskLogs] Still waiting for container to run for task %s (state: %s, waited %d iterations)", m.shortTaskID(), state, waitCount)
-		}
-		time.Sleep(100 * time.Millisecond)
+	// Block until containerID is set by handleEvent, or until context/stop signal.
+	// containerReadyCh is closed by containerOnce.Do in handleEvent — no polling needed.
+	select {
+	case <-ctx.Done():
+		log.Printf("[TaskLogs] Context done while waiting for container for task %s", m.shortTaskID())
+		return
+	case <-m.stopChan:
+		log.Printf("[TaskLogs] Stop signal while waiting for container for task %s", m.shortTaskID())
+		return
+	case <-m.containerReadyCh:
 	}
+
+	m.mu.RLock()
+	containerID := m.containerID
+	state := m.state
+	m.mu.RUnlock()
+
+	log.Printf("[TaskLogs] Container %s for task %s is ready (state: %s)", containerID[:12], m.shortTaskID(), state)
 
 	log.Printf("[TaskLogs] About to start streaming logs for %s/%s (container: %s)", m.serviceName, m.shortTaskID(), containerID[:12])
 
@@ -351,7 +328,7 @@ func (m *Monitor) streamLogs(ctx context.Context) {
 		header := make([]byte, 8)
 		n, err := logReader.Read(header)
 		if err != nil {
-			if err.Error() != "EOF" && err.Error() != "context canceled" {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
 				log.Printf("[TaskLogs] Log stream error for %s: %v", m.shortTaskID(), err)
 			}
 			return
@@ -404,10 +381,13 @@ func (m *Monitor) streamLogs(ctx context.Context) {
 	}
 }
 
-// cleanup performs cleanup when monitor stops
+// cleanup performs cleanup when monitor stops.
+// eventChan is intentionally not closed here: all goroutines have already exited
+// via stopChan by the time cleanup runs (after wg.Wait()). Closing eventChan would
+// risk a panic if SendEvent is called concurrently and its select picks the closed
+// channel branch over the already-closed stopChan branch.
 func (m *Monitor) cleanup() {
 	log.Printf("[TaskMonitor] Cleaning up monitor for task %s", m.shortTaskID())
-	close(m.eventChan)
 }
 
 // GetState returns current task state (thread-safe)
@@ -459,6 +439,20 @@ func (m *Monitor) WaitForHealthy(timeout time.Duration) error {
 // Done returns a channel that is closed when monitor stops
 func (m *Monitor) Done() <-chan struct{} {
 	return m.doneChan
+}
+
+// runWorker executes fn with ctx, decrementing wg when fn returns.
+// Used to start named goroutines from Start() without anonymous closures.
+func (m *Monitor) runWorker(ctx context.Context, wg *sync.WaitGroup, fn func(context.Context)) {
+	defer wg.Done()
+	fn(ctx)
+}
+
+// runStreamLogs wraps streamLogs with lifecycle logging.
+func (m *Monitor) runStreamLogs(ctx context.Context) {
+	log.Printf("[TaskMonitor] Log streaming goroutine started for task %s", m.shortTaskID())
+	m.streamLogs(ctx)
+	log.Printf("[TaskMonitor] Log streaming goroutine ended for task %s", m.shortTaskID())
 }
 
 // shortTaskID returns shortened task ID for logging
