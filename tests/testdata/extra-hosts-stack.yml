@@ -1,0 +1,8 @@
+version: "3.8"
+services:
+  web:
+    image: nginx:alpine
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      replicas: 1

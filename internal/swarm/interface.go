@@ -36,6 +36,8 @@ type DockerClient interface {
 
 	NetworkRemove(ctx context.Context, networkID string) error
 
+	NodeList(ctx context.Context, options swarm.NodeListOptions) ([]swarm.Node, error)
+
 	ImagePull(ctx context.Context, refStr string, options image.PullOptions) (io.ReadCloser, error)
 
 	Close() error

@@ -20,6 +20,7 @@ type MockDockerClient struct {
 	containers      []types.Container
 	networks        []network.Summary
 	volumes         []volume.Volume
+	nodes           []swarm.Node
 	removedServices []string
 	updatedServices []string
 	createdServices []swarm.Service
@@ -103,6 +104,10 @@ func (m *MockDockerClient) VolumeInspect(ctx context.Context, volumeID string) (
 
 func (m *MockDockerClient) NetworkRemove(ctx context.Context, networkID string) error {
 	return nil
+}
+
+func (m *MockDockerClient) NodeList(ctx context.Context, options swarm.NodeListOptions) ([]swarm.Node, error) {
+	return m.nodes, nil
 }
 
 func (m *MockDockerClient) ImagePull(ctx context.Context, refStr string, options image.PullOptions) (io.ReadCloser, error) {

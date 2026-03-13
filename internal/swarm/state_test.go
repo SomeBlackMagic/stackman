@@ -86,6 +86,9 @@ func (m *mockStateDockerClient) VolumeInspect(ctx context.Context, volumeID stri
 func (m *mockStateDockerClient) NetworkRemove(ctx context.Context, networkID string) error {
 	return nil
 }
+func (m *mockStateDockerClient) NodeList(ctx context.Context, options swarm.NodeListOptions) ([]swarm.Node, error) {
+	return nil, nil
+}
 func (m *mockStateDockerClient) ImagePull(ctx context.Context, refStr string, options image.PullOptions) (io.ReadCloser, error) {
 	return nil, nil
 }

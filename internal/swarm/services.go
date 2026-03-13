@@ -13,6 +13,41 @@ import (
 	"github.com/SomeBlackMagic/stackman/internal/compose"
 )
 
+// resolveServiceExtraHosts выполняет разрешение "host-gateway" в extra_hosts.
+// Для одноузлового Swarm: автоматически определяет IP шлюза docker0.
+// Для многоузлового Swarm: возвращает ошибку — IP некорректен для worker-узлов.
+func (d *StackDeployer) resolveServiceExtraHosts(ctx context.Context, serviceName string, service *compose.Service) error {
+	if !hasHostGateway(service.ExtraHosts) {
+		return nil
+	}
+
+	multiNode, err := IsMultiNodeSwarm(ctx, d.cli)
+	if err != nil {
+		return fmt.Errorf("failed to check swarm topology for host-gateway resolution: %w", err)
+	}
+	if multiNode {
+		return fmt.Errorf(
+			"service %q uses 'host-gateway' in extra_hosts, which is not supported in multi-node Swarm clusters: "+
+				"each worker node has a different host IP. "+
+				"Use explicit IP addresses instead, or use placement constraints to pin the service to a specific node",
+			serviceName,
+		)
+	}
+
+	gatewayIP, err := DetectHostGatewayIP(ctx, d.cli)
+	if err != nil {
+		return fmt.Errorf("failed to detect host gateway IP for service %s: %w", serviceName, err)
+	}
+
+	service.ExtraHosts, err = compose.ResolveExtraHosts(service.ExtraHosts, gatewayIP)
+	if err != nil {
+		return fmt.Errorf("failed to resolve extra_hosts for service %s: %w", serviceName, err)
+	}
+
+	log.Printf("Resolved host-gateway to %s for service %s", gatewayIP, serviceName)
+	return nil
+}
+
 func (d *StackDeployer) deployServices(ctx context.Context, services map[string]*compose.Service, deployID string) (*DeploymentResult, error) {
 	result := &DeploymentResult{
 		UpdatedServices: make([]ServiceUpdateResult, 0, len(services)),
@@ -35,6 +70,11 @@ func (d *StackDeployer) deployServices(ctx context.Context, services map[string]
 
 func (d *StackDeployer) deployService(ctx context.Context, serviceName string, service *compose.Service, deployID string) (*ServiceUpdateResult, error) {
 	fullName := fmt.Sprintf("%s_%s", d.stackName, serviceName)
+
+	// Resolve host-gateway in extra_hosts before conversion
+	if err := d.resolveServiceExtraHosts(ctx, serviceName, service); err != nil {
+		return nil, err
+	}
 
 	// Convert compose service to swarm spec
 	spec, err := compose.ConvertToSwarmSpec(serviceName, service, d.stackName)
