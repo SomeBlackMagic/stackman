@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -12,7 +11,7 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/client"
+	flag "github.com/spf13/pflag"
 )
 
 // ExecuteEvents runs the events command
@@ -20,13 +19,13 @@ func ExecuteEvents(args []string) {
 	fs := flag.NewFlagSet("events", flag.ExitOnError)
 
 	// Required flags
-	stackName := fs.String("n", "", "Stack name (required)")
+	stackName := fs.StringP("name", "n", "", "Stack name (required)")
 
 	// Optional flags
-	serviceName := fs.String("service", "", "Service name (optional, shows events for all services if not specified)")
+	serviceName := fs.StringP("service", "s", "", "Service name (optional, shows events for all services if not specified)")
 	since := fs.String("since", "", "Show events since timestamp (e.g. 2023-01-01T00:00:00Z) or duration (e.g. 10m)")
 	until := fs.String("until", "", "Show events until timestamp (e.g. 2023-01-01T00:00:00Z) or duration (e.g. 10m)")
-	follow := fs.Bool("follow", false, "Follow event stream (default: show past events)")
+	follow := fs.BoolP("follow", "f", false, "Follow event stream (default: show past events)")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Usage: stackman events -n <stack> [flags]
@@ -44,7 +43,7 @@ Flags:
 
 	// Validate required flags
 	if *stackName == "" {
-		fmt.Fprintf(os.Stderr, "Error: -n (stack name) is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: -n/--name (stack name) is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -73,7 +72,7 @@ func runEvents(stackName string, opts *EventsOptions) error {
 	ctx := context.Background()
 
 	// Initialize Docker client
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := newDockerClient()
 	if err != nil {
 		return fmt.Errorf("docker client init: %w", err)
 	}

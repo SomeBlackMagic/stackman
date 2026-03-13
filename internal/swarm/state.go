@@ -14,7 +14,7 @@ import (
 )
 
 // GetCurrentState reads the current state of a stack from Swarm
-func GetCurrentState(ctx context.Context, cli DockerClient, stackName string) (*plan.CurrentState, error) {
+func GetCurrentState(ctx context.Context, cli StateClient, stackName string) (*plan.CurrentState, error) {
 	state := &plan.CurrentState{
 		Services: make(map[string]swarm.Service),
 		Networks: make(map[string]swarm.Network),

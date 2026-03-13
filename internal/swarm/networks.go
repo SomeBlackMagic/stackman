@@ -3,7 +3,6 @@ package swarm
 import (
 	"context"
 	"fmt"
-	"log"
 
 	"github.com/docker/docker/api/types/network"
 
@@ -22,7 +21,7 @@ func (d *StackDeployer) createNetworks(ctx context.Context, networks map[string]
 		// Check if network already exists
 		_, err := d.cli.NetworkInspect(ctx, fullName, network.InspectOptions{})
 		if err == nil {
-			log.Printf("Network %s already exists", fullName)
+			d.logf("Network %s already exists", fullName)
 			continue
 		}
 
@@ -56,7 +55,7 @@ func (d *StackDeployer) createNetworks(ctx context.Context, networks map[string]
 			return fmt.Errorf("failed to create network %s: %w", fullName, err)
 		}
 
-		log.Printf("Created network: %s", fullName)
+		d.logf("Created network: %s", fullName)
 	}
 
 	return nil
@@ -68,7 +67,7 @@ func (d *StackDeployer) ensureDefaultNetwork(ctx context.Context) error {
 	// Check if network exists
 	_, err := d.cli.NetworkInspect(ctx, networkName, network.InspectOptions{})
 	if err == nil {
-		log.Printf("Default network %s already exists", networkName)
+		d.logf("Default network %s already exists", networkName)
 		return nil
 	}
 
@@ -85,6 +84,6 @@ func (d *StackDeployer) ensureDefaultNetwork(ctx context.Context) error {
 		return fmt.Errorf("failed to create default network: %w", err)
 	}
 
-	log.Printf("Created default network: %s", networkName)
+	d.logf("Created default network: %s", networkName)
 	return nil
 }

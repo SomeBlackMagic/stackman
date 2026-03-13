@@ -3,7 +3,7 @@ package health
 import (
 	"context"
 	"fmt"
-	"log"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -13,12 +13,12 @@ import (
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/client"
 )
 
 // Watcher monitors Docker events and emits task lifecycle events
 type Watcher struct {
-	client    client.APIClient
+	client    DockerClient
+	logger    Logger
 	stackName string
 
 	// Optional: filter by specific service, version and deployID
@@ -48,6 +48,7 @@ type Watcher struct {
 
 	// shutdown management
 	shutdownOnce sync.Once
+	workersWG    sync.WaitGroup
 	done         chan struct{}
 }
 
@@ -64,9 +65,15 @@ type taskState struct {
 }
 
 // NewWatcher creates a new task event watcher for entire stack
-func NewWatcher(client client.APIClient, stackName string) *Watcher {
+func NewWatcher(client DockerClient, stackName string) *Watcher {
+	return NewWatcherWithLogger(client, stackName, nil)
+}
+
+// NewWatcherWithLogger creates a new task event watcher for entire stack with custom logger.
+func NewWatcherWithLogger(client DockerClient, stackName string, logger Logger) *Watcher {
 	return &Watcher{
 		client:        client,
+		logger:        withDefaultLogger(logger),
 		stackName:     stackName,
 		eventChan:     make(chan Event, 100), // buffered to avoid blocking
 		subscribers:   make([]chan Event, 0),
@@ -79,9 +86,15 @@ func NewWatcher(client client.APIClient, stackName string) *Watcher {
 
 // NewServiceWatcher creates a task watcher filtered for specific service, version and deployID
 // Only tasks with version >= minVersion AND matching deployID for this serviceID will emit events
-func NewServiceWatcher(client client.APIClient, stackName string, serviceID string, minVersion uint64, deployID string) *Watcher {
+func NewServiceWatcher(client DockerClient, stackName string, serviceID string, minVersion uint64, deployID string) *Watcher {
+	return NewServiceWatcherWithLogger(client, stackName, serviceID, minVersion, deployID, nil)
+}
+
+// NewServiceWatcherWithLogger creates a task watcher with custom logger.
+func NewServiceWatcherWithLogger(client DockerClient, stackName string, serviceID string, minVersion uint64, deployID string, logger Logger) *Watcher {
 	return &Watcher{
 		client:          client,
+		logger:          withDefaultLogger(logger),
 		stackName:       stackName,
 		filterServiceID: serviceID,
 		filterVersion:   minVersion,
@@ -100,21 +113,19 @@ func NewServiceWatcher(client client.APIClient, stackName string, serviceID stri
 func (w *Watcher) Start(ctx context.Context) error {
 	// Initialize service name cache
 	if err := w.loadServiceNames(ctx); err != nil {
-		log.Printf("Warning: failed to load service names: %v", err)
+		w.logf("Warning: failed to load service names: %v", err)
 	}
 
 	// Scan and mark existing tasks before starting monitoring
 	// This prevents emitting events for already-running containers
 	if err := w.markExistingTasks(ctx); err != nil {
-		log.Printf("Warning: failed to scan existing tasks: %v", err)
+		w.logf("Warning: failed to scan existing tasks: %v", err)
 	}
 
-	// Start event broadcaster
-	go w.broadcastEvents(ctx)
-
-	// Start periodic task polling (in addition to events)
-	// This catches tasks that were created before we subscribed to events
-	go w.pollTasks(ctx)
+	// Start event broadcaster and periodic polling workers.
+	w.workersWG.Add(2)
+	go w.runWorker(ctx, "broadcastEvents", w.broadcastEvents)
+	go w.runWorker(ctx, "pollTasks", w.pollTasks)
 
 	// Subscribe to Docker events
 	// NOTE: Docker Swarm does NOT emit "task" type events through Events API
@@ -127,18 +138,19 @@ func (w *Watcher) Start(ctx context.Context) error {
 		Filters: eventFilter,
 	})
 
-	log.Printf("[TaskWatcher] Started watching events for stack: %s", w.stackName)
+	w.logf("[TaskWatcher] Started watching events for stack: %s", w.stackName)
+	defer w.workersWG.Wait()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[TaskWatcher] Context cancelled, stopping watcher")
+			w.logf("[TaskWatcher] Context cancelled, stopping watcher")
 			w.shutdown()
 			return ctx.Err()
 
 		case err := <-errChan:
 			if err != nil {
-				log.Printf("[TaskWatcher] Error receiving events: %v", err)
+				w.logf("[TaskWatcher] Error receiving events: %v", err)
 				w.shutdown()
 				return err
 			}
@@ -185,7 +197,7 @@ func (w *Watcher) handleDockerEvent(ctx context.Context, dockerEvent events.Mess
 	}
 
 	// TODO Debug: log all events for this stack
-	//log.Printf("[TaskWatcher] DEBUG: Received event Type=%s Action=%s Actor.ID=%s ServiceID=%s",
+	//w.logf("[TaskWatcher] DEBUG: Received event Type=%s Action=%s Actor.ID=%s ServiceID=%s",
 	//	dockerEvent.Type, dockerEvent.Action, dockerEvent.Actor.ID[:min(12, len(dockerEvent.Actor.ID))],
 	//	dockerEvent.Actor.Attributes["com.docker.swarm.service.id"])
 
@@ -198,7 +210,7 @@ func (w *Watcher) handleDockerEvent(ctx context.Context, dockerEvent events.Mess
 		w.handleServiceEvent(ctx, dockerEvent)
 	default:
 		// Log unknown event types for debugging
-		log.Printf("[TaskWatcher] DEBUG: Unknown event type: %s (action: %s)",
+		w.logf("[TaskWatcher] DEBUG: Unknown event type: %s (action: %s)",
 			dockerEvent.Type, dockerEvent.Action)
 	}
 }
@@ -299,14 +311,14 @@ func (w *Watcher) handleContainerEvent(ctx context.Context, dockerEvent events.M
 		task, err := w.InspectTask(ctx, taskID)
 		if err != nil {
 			// Can't get task info, log and skip
-			log.Printf("[TaskWatcher] WARNING: Failed to inspect task %s for version/deployID check: %v", shortID(taskID), err)
+			w.logf("[TaskWatcher] WARNING: Failed to inspect task %s for version/deployID check: %v", shortID(taskID), err)
 			return
 		}
 
 		// Check version filter
 		if w.filterVersion > 0 && task.Version.Index < w.filterVersion {
 			// TODO Debug logs
-			//log.Printf("[TaskWatcher] Skipping task %s (version %d < %d)", taskID[:12], task.Version.Index, w.filterVersion)
+			//w.logf("[TaskWatcher] Skipping task %s (version %d < %d)", taskID[:12], task.Version.Index, w.filterVersion)
 			return
 		}
 
@@ -319,14 +331,14 @@ func (w *Watcher) handleContainerEvent(ctx context.Context, dockerEvent events.M
 
 			if taskDeployID != w.filterDeployID {
 				// TODO Debug logs
-				//log.Printf("[TaskWatcher] Skipping task %s (deployID '%s' != '%s')", taskID[:12], taskDeployID, w.filterDeployID)
+				//w.logf("[TaskWatcher] Skipping task %s (deployID '%s' != '%s')", taskID[:12], taskDeployID, w.filterDeployID)
 				return
 			}
 		}
 
 		// Log only once per task (on create event)
 		if dockerEvent.Action == "create" {
-			log.Printf("[TaskWatcher] Processing task %s (version %d >= %d, deployID: %s)",
+			w.logf("[TaskWatcher] Processing task %s (version %d >= %d, deployID: %s)",
 				shortID(taskID), task.Version.Index, w.filterVersion, w.filterDeployID)
 		}
 	}
@@ -434,7 +446,7 @@ func (w *Watcher) emitEvent(event Event) {
 		// Watcher is shutting down
 	default:
 		// Event channel is full, log warning
-		log.Printf("[TaskWatcher] WARNING: event channel full, dropping event: %s for task %s",
+		w.logf("[TaskWatcher] WARNING: event channel full, dropping event: %s for task %s",
 			event.Type, event.TaskID)
 	}
 }
@@ -465,7 +477,7 @@ func (w *Watcher) broadcastEvents(ctx context.Context) {
 					// Event sent successfully
 				default:
 					// Subscriber is slow, log warning
-					log.Printf("[TaskWatcher] WARNING: subscriber slow, dropping event for task %s",
+					w.logf("[TaskWatcher] WARNING: subscriber slow, dropping event for task %s",
 						event.TaskID)
 				}
 			}
@@ -556,7 +568,7 @@ func (w *Watcher) CleanupOldTasks(maxAge time.Duration) int {
 	}
 
 	if removed > 0 {
-		log.Printf("[TaskWatcher] Cleaned up %d old task states", removed)
+		w.logf("[TaskWatcher] Cleaned up %d old task states", removed)
 	}
 
 	return removed
@@ -568,9 +580,24 @@ func (w *Watcher) CleanupOldTasks(maxAge time.Duration) int {
 // a zero-value Event from the closed channel before seeing the done signal.
 func (w *Watcher) shutdown() {
 	w.shutdownOnce.Do(func() {
-		log.Printf("[TaskWatcher] Shutting down")
+		w.logf("[TaskWatcher] Shutting down")
 		close(w.done)
 	})
+}
+
+func (w *Watcher) logf(format string, args ...any) {
+	w.logger.Printf(format, args...)
+}
+
+func (w *Watcher) runWorker(ctx context.Context, name string, fn func(context.Context)) {
+	defer w.workersWG.Done()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			w.logf("[TaskWatcher] panic recovered in %s: %v\n%s", name, recovered, string(debug.Stack()))
+			w.shutdown()
+		}
+	}()
+	fn(ctx)
 }
 
 // InspectTask fetches detailed task information from Docker API
@@ -614,10 +641,17 @@ func (w *Watcher) SubscribeToService(ctx context.Context, serviceID string) (<-c
 	allEvents := w.Subscribe()
 	filtered := make(chan Event, 50)
 	done := make(chan struct{})
+	stopped := make(chan struct{})
 
-	go w.runServiceEventFilter(ctx, serviceID, allEvents, filtered, done)
+	go func() {
+		defer close(stopped)
+		w.runServiceEventFilter(ctx, serviceID, allEvents, filtered, done)
+	}()
 
-	return filtered, func() { close(done) }
+	return filtered, func() {
+		close(done)
+		<-stopped
+	}
 }
 
 // runServiceEventFilter forwards events matching serviceID from allEvents to filtered.
@@ -644,7 +678,7 @@ func (w *Watcher) runServiceEventFilter(ctx context.Context, serviceID string, a
 				case <-done:
 					return
 				default:
-					log.Printf("[TaskWatcher] WARNING: Filtered channel full for service %s", serviceID)
+					w.logf("[TaskWatcher] WARNING: Filtered channel full for service %s", serviceID)
 				}
 			}
 		}
@@ -661,12 +695,12 @@ func (w *Watcher) pollTasks(ctx context.Context) {
 	cleanupTicker := time.NewTicker(5 * time.Minute)
 	defer cleanupTicker.Stop()
 
-	log.Printf("[TaskWatcher] Started periodic task polling")
+	w.logf("[TaskWatcher] Started periodic task polling")
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[TaskWatcher] Task polling stopped")
+			w.logf("[TaskWatcher] Task polling stopped")
 			return
 		case <-pollTicker.C:
 			w.discoverTasks(ctx)
@@ -691,7 +725,7 @@ func (w *Watcher) discoverTasks(ctx context.Context) {
 		Filters: filter,
 	})
 	if err != nil {
-		log.Printf("[TaskWatcher] Warning: failed to poll tasks: %v", err)
+		w.logf("[TaskWatcher] Warning: failed to poll tasks: %v", err)
 		return
 	}
 
@@ -734,7 +768,7 @@ func (w *Watcher) discoverTasks(ctx context.Context) {
 
 		if !exists {
 			// New task discovered! Emit creation event
-			log.Printf("[TaskWatcher] Discovered new task via polling: %s (service: %s, version: %d, state: %s)",
+			w.logf("[TaskWatcher] Discovered new task via polling: %s (service: %s, version: %d, state: %s)",
 				shortID(task.ID), shortID(task.ServiceID), task.Version.Index, task.Status.State)
 
 			// Create task state
@@ -848,11 +882,11 @@ func (w *Watcher) markExistingTasks(ctx context.Context) error {
 		taskID := c.Labels["com.docker.swarm.task.id"]
 		if taskID != "" {
 			w.existingTasks[taskID] = true
-			log.Printf("[TaskWatcher] Marked task %s as existing (container %s)",
+			w.logf("[TaskWatcher] Marked task %s as existing (container %s)",
 				shortID(taskID), shortID(c.ID))
 		}
 	}
 
-	log.Printf("[TaskWatcher] Marked %d existing task(s) to ignore their events", len(w.existingTasks))
+	w.logf("[TaskWatcher] Marked %d existing task(s) to ignore their events", len(w.existingTasks))
 	return nil
 }

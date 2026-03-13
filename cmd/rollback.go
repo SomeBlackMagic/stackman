@@ -2,14 +2,13 @@ package cmd
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log"
 	"os"
 	"time"
 
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
+	flag "github.com/spf13/pflag"
 
 	"github.com/SomeBlackMagic/stackman/internal/swarm"
 )
@@ -19,7 +18,7 @@ func ExecuteRollback(args []string) {
 	fs := flag.NewFlagSet("rollback", flag.ExitOnError)
 
 	// Required flags
-	stackName := fs.String("n", "", "Stack name (required)")
+	stackName := fs.StringP("name", "n", "", "Stack name (required)")
 
 	// Optional flags
 	rollbackTimeout := fs.Duration("rollback-timeout", 10*time.Minute, "Rollback timeout")
@@ -45,7 +44,7 @@ Flags:
 
 	// Validate required flags
 	if *stackName == "" {
-		fmt.Fprintf(os.Stderr, "Error: -n (stack name) is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: -n/--name (stack name) is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -70,7 +69,7 @@ func runRollback(stackName string, opts *RollbackOptions) error {
 	defer cancel()
 
 	// Initialize Docker client
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := newDockerClient()
 	if err != nil {
 		return fmt.Errorf("docker client init: %w", err)
 	}
@@ -79,7 +78,7 @@ func runRollback(stackName string, opts *RollbackOptions) error {
 	log.Printf("Starting rollback for stack: %s", stackName)
 
 	// Create deployer
-	stackDeployer := swarm.NewStackDeployer(cli, stackName, 3)
+	stackDeployer := swarm.NewStackDeployerWithLogger(cli, stackName, 3, log.Default())
 
 	// Get current services
 	services, err := stackDeployer.GetStackServices(ctx)

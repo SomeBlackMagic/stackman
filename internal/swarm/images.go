@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,15 +19,15 @@ import (
 func (d *StackDeployer) pullImages(ctx context.Context, services map[string]*compose.Service) error {
 	for name, svc := range services {
 		if svc.Image == "" {
-			log.Printf("Service %s has no image specified, skipping pull", name)
+			d.logf("Service %s has no image specified, skipping pull", name)
 			continue
 		}
 
-		log.Printf("Pulling image for service %s: %s", name, svc.Image)
+		d.logf("Pulling image for service %s: %s", name, svc.Image)
 
 		// Pull image with credentials from Docker config (~/.docker/config.json)
 		pullOpts := image.PullOptions{
-			RegistryAuth: getRegistryAuth(svc.Image),
+			RegistryAuth: d.getRegistryAuth(svc.Image),
 		}
 
 		out, err := d.cli.ImagePull(ctx, svc.Image, pullOpts)
@@ -42,13 +41,13 @@ func (d *StackDeployer) pullImages(ctx context.Context, services map[string]*com
 			return fmt.Errorf("failed to read pull progress for %s: %w", svc.Image, err)
 		}
 
-		log.Printf("Successfully pulled image: %s", svc.Image)
+		d.logf("Successfully pulled image: %s", svc.Image)
 	}
 
 	return nil
 }
 
-func getRegistryAuth(imageName string) string {
+func (d *StackDeployer) getRegistryAuth(imageName string) string {
 	// Extract registry from image name
 	registryURL := extractRegistry(imageName)
 	if registryURL == "" {
@@ -60,12 +59,12 @@ func getRegistryAuth(imageName string) string {
 	configPath := filepath.Join(os.Getenv("HOME"), ".docker", "config.json")
 	if dockerConfigPath := os.Getenv("DOCKER_CONFIG_PATH"); dockerConfigPath != "" {
 		configPath = filepath.Join(dockerConfigPath, "config.json")
-		log.Printf("Using Docker config from DOCKER_CONFIG_PATH: %s", configPath)
+		d.logf("Using Docker config from DOCKER_CONFIG_PATH: %s", configPath)
 	}
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		log.Printf("Warning: could not read Docker config from %s: %v", configPath, err)
+		d.logf("Warning: could not read Docker config from %s: %v", configPath, err)
 		return ""
 	}
 
@@ -76,7 +75,7 @@ func getRegistryAuth(imageName string) string {
 	}
 
 	if err := json.Unmarshal(data, &config); err != nil {
-		log.Printf("Warning: could not parse Docker config: %v", err)
+		d.logf("Warning: could not parse Docker config: %v", err)
 		return ""
 	}
 
@@ -86,13 +85,13 @@ func getRegistryAuth(imageName string) string {
 		// We need to decode it, then encode as registry.AuthConfig
 		authBytes, err := base64.StdEncoding.DecodeString(auth.Auth)
 		if err != nil {
-			log.Printf("Warning: could not decode auth: %v", err)
+			d.logf("Warning: could not decode auth: %v", err)
 			return ""
 		}
 
 		parts := strings.SplitN(string(authBytes), ":", 2)
 		if len(parts) != 2 {
-			log.Printf("Warning: invalid auth format")
+			d.logf("Warning: invalid auth format")
 			return ""
 		}
 
@@ -104,7 +103,7 @@ func getRegistryAuth(imageName string) string {
 
 		encodedJSON, err := json.Marshal(authConfig)
 		if err != nil {
-			log.Printf("Warning: could not encode auth config: %v", err)
+			d.logf("Warning: could not encode auth config: %v", err)
 			return ""
 		}
 
@@ -160,9 +159,9 @@ func (d *StackDeployer) logPullProgress(reader io.ReadCloser) error {
 		currentStatus := fmt.Sprintf("%s: %s", progress.ID, progress.Status)
 		if progress.Status != "" && currentStatus != lastStatus {
 			if progress.Progress != "" {
-				log.Printf("  %s %s %s", progress.ID, progress.Status, progress.Progress)
+				d.logf("  %s %s %s", progress.ID, progress.Status, progress.Progress)
 			} else {
-				log.Printf("  %s %s", progress.ID, progress.Status)
+				d.logf("  %s %s", progress.ID, progress.Status)
 			}
 			lastStatus = currentStatus
 		}

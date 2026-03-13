@@ -3,7 +3,6 @@ package swarm
 import (
 	"context"
 	"fmt"
-	"log"
 
 	"github.com/docker/docker/api/types/volume"
 
@@ -17,7 +16,7 @@ func (d *StackDeployer) createVolumes(ctx context.Context, volumes map[string]*c
 		// Check if volume already exists
 		_, err := d.cli.VolumeInspect(ctx, fullName)
 		if err == nil {
-			log.Printf("Volume %s already exists", fullName)
+			d.logf("Volume %s already exists", fullName)
 			continue
 		}
 
@@ -50,7 +49,7 @@ func (d *StackDeployer) createVolumes(ctx context.Context, volumes map[string]*c
 			return fmt.Errorf("failed to create volume %s: %w", fullName, err)
 		}
 
-		log.Printf("Created volume: %s", fullName)
+		d.logf("Created volume: %s", fullName)
 	}
 
 	return nil

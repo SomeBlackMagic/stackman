@@ -3,7 +3,6 @@ package swarm
 import (
 	"context"
 	"fmt"
-	"log"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
@@ -43,26 +42,26 @@ func (d *StackDeployer) removeObsoleteServices(ctx context.Context, services map
 
 	if len(servicesToRemove) == 0 {
 		// TODO Debug logs
-		// log.Printf("No obsolete services to remove")
+		// d.logf("No obsolete services to remove")
 		return nil
 	}
 
 	// Remove obsolete services
-	log.Printf("Found %d obsolete service(s) to remove", len(servicesToRemove))
+	d.logf("Found %d obsolete service(s) to remove", len(servicesToRemove))
 	for _, svc := range servicesToRemove {
-		log.Printf("Removing obsolete service: %s", svc.Spec.Name)
+		d.logf("Removing obsolete service: %s", svc.Spec.Name)
 		if err := d.cli.ServiceRemove(ctx, svc.ID); err != nil {
 			return fmt.Errorf("failed to remove service %s: %w", svc.Spec.Name, err)
 		}
-		log.Printf("Service %s marked for removal", svc.Spec.Name)
+		d.logf("Service %s marked for removal", svc.Spec.Name)
 	}
 
 	// Wait for services to be fully removed
-	log.Printf("Waiting for services to be fully removed...")
+	d.logf("Waiting for services to be fully removed...")
 	if err := d.waitForServicesRemoval(ctx, servicesToRemove); err != nil {
 		return fmt.Errorf("failed to wait for service removal: %w", err)
 	}
-	log.Printf("All obsolete services removed successfully")
+	d.logf("All obsolete services removed successfully")
 
 	return nil
 }
@@ -70,7 +69,7 @@ func (d *StackDeployer) removeObsoleteServices(ctx context.Context, services map
 // waitForServicesRemoval waits for services to be completely removed
 func (d *StackDeployer) waitForServicesRemoval(ctx context.Context, services []swarm.Service) error {
 	for _, svc := range services {
-		log.Printf("Waiting for service %s to be removed...", svc.Spec.Name)
+		d.logf("Waiting for service %s to be removed...", svc.Spec.Name)
 
 		for {
 			select {
@@ -81,7 +80,7 @@ func (d *StackDeployer) waitForServicesRemoval(ctx context.Context, services []s
 				_, _, err := d.cli.ServiceInspectWithRaw(ctx, svc.ID, types.ServiceInspectOptions{})
 				if err != nil {
 					// Service not found - it's been removed
-					log.Printf("Service %s has been removed", svc.Spec.Name)
+					d.logf("Service %s has been removed", svc.Spec.Name)
 					break
 				}
 
@@ -97,7 +96,7 @@ func (d *StackDeployer) waitForServicesRemoval(ctx context.Context, services []s
 
 // RemoveStack removes all resources associated with the stack
 func (d *StackDeployer) RemoveStack(ctx context.Context) error {
-	log.Printf("Removing stack: %s", d.stackName)
+	d.logf("Removing stack: %s", d.stackName)
 
 	// Remove services
 	services, err := d.GetStackServices(ctx)
@@ -106,9 +105,9 @@ func (d *StackDeployer) RemoveStack(ctx context.Context) error {
 	}
 
 	for _, svc := range services {
-		log.Printf("Removing service: %s", svc.Spec.Name)
+		d.logf("Removing service: %s", svc.Spec.Name)
 		if err := d.cli.ServiceRemove(ctx, svc.ID); err != nil {
-			log.Printf("Warning: failed to remove service %s: %v", svc.Spec.Name, err)
+			d.logf("Warning: failed to remove service %s: %v", svc.Spec.Name, err)
 		}
 	}
 
@@ -123,19 +122,19 @@ func (d *StackDeployer) RemoveStack(ctx context.Context) error {
 	}
 
 	for _, net := range networks {
-		log.Printf("Removing network: %s", net.Name)
+		d.logf("Removing network: %s", net.Name)
 		if err := d.cli.NetworkRemove(ctx, net.ID); err != nil {
-			log.Printf("Warning: failed to remove network %s: %v", net.Name, err)
+			d.logf("Warning: failed to remove network %s: %v", net.Name, err)
 		}
 	}
 
-	log.Printf("Stack %s removed", d.stackName)
+	d.logf("Stack %s removed", d.stackName)
 	return nil
 }
 
 // RemoveExitedContainers removes all exited containers from the stack
 func (d *StackDeployer) RemoveExitedContainers(ctx context.Context) error {
-	//log.Printf("Removing exited containers from stack: %s", d.stackName)
+	//d.logf("Removing exited containers from stack: %s", d.stackName)
 	//
 	//// List all exited swarm task containers
 	//containerFilters := filters.NewArgs(
@@ -163,11 +162,11 @@ func (d *StackDeployer) RemoveExitedContainers(ctx context.Context) error {
 	//}
 	//
 	//if len(stackContainers) == 0 {
-	//	log.Printf("No exited containers found for stack: %s", d.stackName)
+	//	d.logf("No exited containers found for stack: %s", d.stackName)
 	//	return nil
 	//}
 	//
-	//log.Printf("Found %d exited container(s) to remove", len(stackContainers))
+	//d.logf("Found %d exited container(s) to remove", len(stackContainers))
 	//
 	//// Remove each exited container
 	//for _, cont := range stackContainers {
@@ -176,16 +175,16 @@ func (d *StackDeployer) RemoveExitedContainers(ctx context.Context) error {
 	//		containerName = containerName[1:] // Remove leading slash
 	//	}
 	//
-	//	log.Printf("Removing exited container: %s (ID: %s)", containerName, cont.ID[:12])
+	//	d.logf("Removing exited container: %s (ID: %s)", containerName, cont.ID[:12])
 	//	if err := d.cli.ContainerRemove(ctx, cont.ID, container.RemoveOptions{
 	//		Force: true,
 	//	}); err != nil {
-	//		log.Printf("Warning: failed to remove container %s: %v", containerName, err)
+	//		d.logf("Warning: failed to remove container %s: %v", containerName, err)
 	//	} else {
-	//		log.Printf("Container %s removed successfully", containerName)
+	//		d.logf("Container %s removed successfully", containerName)
 	//	}
 	//}
 	//
-	//log.Printf("Finished removing exited containers from stack: %s", d.stackName)
+	//d.logf("Finished removing exited containers from stack: %s", d.stackName)
 	return nil
 }

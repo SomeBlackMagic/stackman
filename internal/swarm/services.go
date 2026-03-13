@@ -3,7 +3,6 @@ package swarm
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -44,7 +43,7 @@ func (d *StackDeployer) resolveServiceExtraHosts(ctx context.Context, serviceNam
 		return fmt.Errorf("failed to resolve extra_hosts for service %s: %w", serviceName, err)
 	}
 
-	log.Printf("Resolved host-gateway to %s for service %s", gatewayIP, serviceName)
+	d.logf("Resolved host-gateway to %s for service %s", gatewayIP, serviceName)
 	return nil
 }
 
@@ -119,12 +118,12 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 	}
 
 	// Get registry auth for the image
-	registryAuth := getRegistryAuth(service.Image)
+	registryAuth := d.getRegistryAuth(service.Image)
 
 	if len(existingServices) > 0 {
 		// Update existing service
 		existing := existingServices[0]
-		log.Printf("Updating service: %s", fullName)
+		d.logf("Updating service: %s", fullName)
 
 		// NOTE: We intentionally use the NEW deployID for updates
 		// The deployID must be updated so that health checks can identify new tasks
@@ -146,7 +145,7 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 			}
 			if retry < maxRetries-1 {
 				waitTime := time.Duration(retry+1) * time.Second
-				log.Printf("failed to list old tasks (attempt %d/%d): %v, retrying in %v", retry+1, maxRetries, err, waitTime)
+				d.logf("failed to list old tasks (attempt %d/%d): %v, retrying in %v", retry+1, maxRetries, err, waitTime)
 				time.Sleep(waitTime)
 			}
 		}
@@ -185,7 +184,7 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 			}
 			if retry < maxRetries-1 {
 				waitTime := time.Duration(retry+1) * time.Second
-				log.Printf("failed to list new tasks (attempt %d/%d): %v, retrying in %v", retry+1, maxRetries, err, waitTime)
+				d.logf("failed to list new tasks (attempt %d/%d): %v, retrying in %v", retry+1, maxRetries, err, waitTime)
 				time.Sleep(waitTime)
 			}
 		}
@@ -209,7 +208,7 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 		}
 
 		if hasNewTasks {
-			log.Printf("Service %s updated, new tasks will be created", fullName)
+			d.logf("Service %s updated, new tasks will be created", fullName)
 
 			// Get updated service to retrieve new version
 			updatedService, _, err := d.cli.ServiceInspectWithRaw(ctx, existing.ID, swarm.ServiceInspectOptions{})
@@ -227,14 +226,14 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 				DeployID:    deployID,
 			}, nil
 		} else {
-			log.Printf("Service %s: no changes detected (tasks not recreated)", fullName)
+			d.logf("Service %s: no changes detected (tasks not recreated)", fullName)
 
 			// Return nil - service was NOT changed
 			return nil, nil
 		}
 	} else {
 		// Create new service
-		log.Printf("Creating service: %s", fullName)
+		d.logf("Creating service: %s", fullName)
 
 		createResponse, err := d.cli.ServiceCreate(ctx, *spec, swarm.ServiceCreateOptions{
 			EncodedRegistryAuth: registryAuth,
@@ -242,7 +241,7 @@ func (d *StackDeployer) deployService(ctx context.Context, serviceName string, s
 		if err != nil {
 			return nil, fmt.Errorf("failed to create service: %w", err)
 		}
-		log.Printf("Service %s created", fullName)
+		d.logf("Service %s created", fullName)
 
 		// Get created service to retrieve a version
 		createdService, _, err := d.cli.ServiceInspectWithRaw(ctx, createResponse.ID, swarm.ServiceInspectOptions{})
@@ -280,7 +279,7 @@ func (d *StackDeployer) waitForServiceUpdate(ctx context.Context, serviceID stri
 		oldTaskIDs[task.ID] = true
 	}
 
-	log.Printf("Tracking %d old tasks for service update", len(oldTasks))
+	d.logf("Tracking %d old tasks for service update", len(oldTasks))
 
 	start := time.Now()
 	timeout := 5 * time.Minute
@@ -316,7 +315,7 @@ func (d *StackDeployer) waitForServiceUpdate(ctx context.Context, serviceID stri
 			}
 			if retry < maxRetries-1 {
 				waitTime := time.Duration(retry+1) * time.Second
-				log.Printf("failed to list tasks (attempt %d/%d): %v, retrying in %v",
+				d.logf("failed to list tasks (attempt %d/%d): %v, retrying in %v",
 					retry+1, maxRetries, err, waitTime)
 				time.Sleep(waitTime)
 			}
@@ -340,7 +339,7 @@ func (d *StackDeployer) waitForServiceUpdate(ctx context.Context, serviceID stri
 				}
 			}
 			// TODO migrate to debug
-			// log.Printf("Task status: %d old, %d new. States: %v", oldTaskCount, newTaskCount, taskStates)
+			// d.logf("Task status: %d old, %d new. States: %v", oldTaskCount, newTaskCount, taskStates)
 			lastStatusLog = time.Now()
 		}
 
@@ -372,15 +371,15 @@ func (d *StackDeployer) waitForServiceUpdate(ctx context.Context, serviceID stri
 					newFailedTaskCount++
 
 					if task.Status.Err != "" {
-						log.Printf("ERROR: New task %s failed with state %s (desired: %s): %s",
+						d.logf("ERROR: New task %s failed with state %s (desired: %s): %s",
 							task.ID[:12], task.Status.State, task.DesiredState, task.Status.Err)
 					} else {
-						log.Printf("ERROR: New task %s failed with state %s (desired: %s)",
+						d.logf("ERROR: New task %s failed with state %s (desired: %s)",
 							task.ID[:12], task.Status.State, task.DesiredState)
 					}
 
 					if task.Status.ContainerStatus.ExitCode != 0 {
-						log.Printf("  Container exit code: %d", task.Status.ContainerStatus.ExitCode)
+						d.logf("  Container exit code: %d", task.Status.ContainerStatus.ExitCode)
 					}
 				}
 
@@ -442,7 +441,7 @@ func (d *StackDeployer) waitForServiceUpdate(ctx context.Context, serviceID stri
 
 		// If old tasks are shutdown and new tasks are running and healthy, we're done
 		if oldTasksShutdown && hasNewRunningTasks && newTasksHealthy {
-			log.Printf("Service update completed: old tasks shutdown, new tasks running and healthy")
+			d.logf("Service update completed: old tasks shutdown, new tasks running and healthy")
 			return nil
 		}
 

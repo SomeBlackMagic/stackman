@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -14,7 +13,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/client"
+	flag "github.com/spf13/pflag"
 )
 
 // ExecuteLogs runs the logs command
@@ -22,14 +21,14 @@ func ExecuteLogs(args []string) {
 	fs := flag.NewFlagSet("logs", flag.ExitOnError)
 
 	// Required flags
-	stackName := fs.String("n", "", "Stack name (required)")
+	stackName := fs.StringP("name", "n", "", "Stack name (required)")
 
 	// Optional flags
-	serviceName := fs.String("service", "", "Service name (optional, shows logs for all services if not specified)")
-	follow := fs.Bool("follow", false, "Follow log output")
+	serviceName := fs.StringP("service", "s", "", "Service name (optional, shows logs for all services if not specified)")
+	follow := fs.BoolP("follow", "f", false, "Follow log output")
 	tail := fs.String("tail", "100", "Number of lines to show from the end of the logs")
 	since := fs.String("since", "", "Show logs since timestamp (e.g. 2023-01-01T00:00:00Z) or duration (e.g. 10m)")
-	timestamps := fs.Bool("timestamps", false, "Show timestamps")
+	timestamps := fs.BoolP("timestamps", "t", false, "Show timestamps")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Usage: stackman logs -n <stack> [flags]
@@ -47,7 +46,7 @@ Flags:
 
 	// Validate required flags
 	if *stackName == "" {
-		fmt.Fprintf(os.Stderr, "Error: -n (stack name) is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: -n/--name (stack name) is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -78,7 +77,7 @@ func runLogs(stackName string, opts *LogsOptions) error {
 	ctx := context.Background()
 
 	// Initialize Docker client
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := newDockerClient()
 	if err != nil {
 		return fmt.Errorf("docker client init: %w", err)
 	}

@@ -3,7 +3,6 @@ package swarm
 import (
 	"context"
 	"fmt"
-	"log"
 
 	"github.com/docker/docker/api/types/swarm"
 
@@ -11,7 +10,8 @@ import (
 )
 
 type StackDeployer struct {
-	cli                DockerClient
+	cli                DeploymentClient
+	logger             Logger
 	stackName          string
 	MaxFailedTaskCount int // Maximum number of failed tasks before giving up
 }
@@ -32,12 +32,17 @@ type DeploymentResult struct {
 	DeployID        string                // Deployment ID for this deployment
 }
 
-func NewStackDeployer(cli DockerClient, stackName string, maxFailedTaskCount int) *StackDeployer {
+func NewStackDeployer(cli DeploymentClient, stackName string, maxFailedTaskCount int) *StackDeployer {
+	return NewStackDeployerWithLogger(cli, stackName, maxFailedTaskCount, nil)
+}
+
+func NewStackDeployerWithLogger(cli DeploymentClient, stackName string, maxFailedTaskCount int, logger Logger) *StackDeployer {
 	if maxFailedTaskCount <= 0 {
 		maxFailedTaskCount = 3 // Default value
 	}
 	return &StackDeployer{
 		cli:                cli,
+		logger:             withDefaultLogger(logger),
 		stackName:          stackName,
 		MaxFailedTaskCount: maxFailedTaskCount,
 	}
@@ -46,7 +51,7 @@ func NewStackDeployer(cli DockerClient, stackName string, maxFailedTaskCount int
 // Deploy deploys a complete stack from a compose file
 // Returns DeploymentResult with information about updated services, or error
 func (d *StackDeployer) Deploy(ctx context.Context, composeFile *compose.ComposeFile, deployID string) (*DeploymentResult, error) {
-	log.Printf("Starting deployment of stack: %s (DeployID: %s)", d.stackName, deployID)
+	d.logf("Starting deployment of stack: %s (DeployID: %s)", d.stackName, deployID)
 
 	// 1. Remove exited containers from previous deployments
 	if err := d.RemoveExitedContainers(ctx); err != nil {
@@ -82,6 +87,6 @@ func (d *StackDeployer) Deploy(ctx context.Context, composeFile *compose.Compose
 	// Set deployID in result
 	result.DeployID = deployID
 
-	log.Printf("Stack %s deployed successfully (DeployID: %s)", d.stackName, deployID)
+	d.logf("Stack %s deployed successfully (DeployID: %s)", d.stackName, deployID)
 	return result, nil
 }

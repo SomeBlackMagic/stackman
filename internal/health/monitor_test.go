@@ -63,56 +63,68 @@ func TestMonitor_SendEvent(t *testing.T) {
 func TestMonitor_HandleEvent(t *testing.T) {
 	monitor := NewMonitor(nil, "task123", "service456", "mystack_web")
 
-	// Test Created event
-	createdEvent := Event{
-		Type:         EventTypeCreated,
-		TaskID:       "task123",
-		ContainerID:  "container789",
-		State:        "created",
-		DesiredState: "running",
-	}
-	monitor.handleEvent(createdEvent)
-
-	if monitor.containerID != "container789" {
-		t.Errorf("Expected container ID 'container789', got '%s'", monitor.containerID)
-	}
-
-	if monitor.state != "created" {
-		t.Errorf("Expected state 'created', got '%s'", monitor.state)
-	}
-
-	// Test Healthy event
-	healthyEvent := Event{
-		Type:   EventTypeHealthy,
-		TaskID: "task123",
-	}
-	monitor.handleEvent(healthyEvent)
-
-	if monitor.healthStatus != "healthy" {
-		t.Errorf("Expected health status 'healthy', got '%s'", monitor.healthStatus)
-	}
-
-	if monitor.healthChecks != 1 {
-		t.Errorf("Expected 1 health check, got %d", monitor.healthChecks)
-	}
-
-	// Test Unhealthy event
-	unhealthyEvent := Event{
-		Type:   EventTypeUnhealthy,
-		TaskID: "task123",
-	}
-	monitor.handleEvent(unhealthyEvent)
-
-	if monitor.healthStatus != "unhealthy" {
-		t.Errorf("Expected health status 'unhealthy', got '%s'", monitor.healthStatus)
+	testCases := []struct {
+		name             string
+		event            Event
+		wantContainerID  string
+		wantState        string
+		wantHealthStatus string
+		wantHealthChecks int
+		wantFailedChecks int
+	}{
+		{
+			name: "Created",
+			event: Event{
+				Type:         EventTypeCreated,
+				TaskID:       "task123",
+				ContainerID:  "container789",
+				State:        "created",
+				DesiredState: "running",
+			},
+			wantContainerID: "container789",
+			wantState:       "created",
+		},
+		{
+			name: "Healthy",
+			event: Event{
+				Type:   EventTypeHealthy,
+				TaskID: "task123",
+			},
+			wantHealthStatus: "healthy",
+			wantHealthChecks: 1,
+		},
+		{
+			name: "Unhealthy",
+			event: Event{
+				Type:   EventTypeUnhealthy,
+				TaskID: "task123",
+			},
+			wantHealthStatus: "unhealthy",
+			wantHealthChecks: 2,
+			wantFailedChecks: 1,
+		},
 	}
 
-	if monitor.failedChecks != 1 {
-		t.Errorf("Expected 1 failed check, got %d", monitor.failedChecks)
-	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			monitor.handleEvent(tc.event)
 
-	if monitor.healthChecks != 2 {
-		t.Errorf("Expected 2 health checks, got %d", monitor.healthChecks)
+			if tc.wantContainerID != "" && monitor.containerID != tc.wantContainerID {
+				t.Errorf("Expected container ID %q, got %q", tc.wantContainerID, monitor.containerID)
+			}
+			if tc.wantState != "" && monitor.state != tc.wantState {
+				t.Errorf("Expected state %q, got %q", tc.wantState, monitor.state)
+			}
+			if tc.wantHealthStatus != "" && monitor.healthStatus != tc.wantHealthStatus {
+				t.Errorf("Expected health status %q, got %q", tc.wantHealthStatus, monitor.healthStatus)
+			}
+			if tc.wantHealthChecks > 0 && monitor.healthChecks != tc.wantHealthChecks {
+				t.Errorf("Expected %d health checks, got %d", tc.wantHealthChecks, monitor.healthChecks)
+			}
+			if tc.wantFailedChecks > 0 && monitor.failedChecks != tc.wantFailedChecks {
+				t.Errorf("Expected %d failed checks, got %d", tc.wantFailedChecks, monitor.failedChecks)
+			}
+		})
 	}
 }
 

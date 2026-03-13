@@ -2,27 +2,39 @@ package health
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/client"
+)
+
+var (
+	ErrServiceUpdatePaused     = errors.New("service update paused")
+	ErrServiceUpdateRolledBack = errors.New("service update rolled back")
+	ErrServiceRollbackPaused   = errors.New("service rollback paused")
 )
 
 // ServiceUpdateMonitor monitors service update status by polling ServiceInspect
 // This is separate from task monitoring - it tracks overall service update progress
 type ServiceUpdateMonitor struct {
-	client      client.APIClient
+	client      DockerClient
+	logger      Logger
 	serviceID   string
 	serviceName string
 }
 
 // NewServiceUpdateMonitor creates a monitor for service update status
-func NewServiceUpdateMonitor(client client.APIClient, serviceID string, serviceName string) *ServiceUpdateMonitor {
+func NewServiceUpdateMonitor(client DockerClient, serviceID string, serviceName string) *ServiceUpdateMonitor {
+	return NewServiceUpdateMonitorWithLogger(client, serviceID, serviceName, nil)
+}
+
+// NewServiceUpdateMonitorWithLogger creates a monitor for service update status with custom logger.
+func NewServiceUpdateMonitorWithLogger(client DockerClient, serviceID string, serviceName string, logger Logger) *ServiceUpdateMonitor {
 	return &ServiceUpdateMonitor{
 		client:      client,
+		logger:      withDefaultLogger(logger),
 		serviceID:   serviceID,
 		serviceName: serviceName,
 	}
@@ -31,7 +43,7 @@ func NewServiceUpdateMonitor(client client.APIClient, serviceID string, serviceN
 // WaitForUpdateComplete blocks until service update reaches terminal state
 // Returns nil if update completed successfully, error otherwise
 func (m *ServiceUpdateMonitor) WaitForUpdateComplete(ctx context.Context) error {
-	log.Printf("[ServiceUpdateMonitor] Waiting for service %s update to complete...", m.serviceName)
+	m.logf("[ServiceUpdateMonitor] Waiting for service %s update to complete...", m.serviceName)
 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -44,14 +56,14 @@ func (m *ServiceUpdateMonitor) WaitForUpdateComplete(ctx context.Context) error 
 		case <-ticker.C:
 			svc, _, err := m.client.ServiceInspectWithRaw(ctx, m.serviceID, types.ServiceInspectOptions{})
 			if err != nil {
-				log.Printf("[ServiceUpdateMonitor] Failed to inspect service %s: %v", m.serviceName, err)
+				m.logf("[ServiceUpdateMonitor] Failed to inspect service %s: %v", m.serviceName, err)
 				continue
 			}
 
 			// Check if update status is available
 			if svc.UpdateStatus == nil {
 				// No update in progress - service might be freshly created
-				log.Printf("[ServiceUpdateMonitor] No update status for service %s (might be new service)", m.serviceName)
+				m.logf("[ServiceUpdateMonitor] No update status for service %s (might be new service)", m.serviceName)
 				return nil
 			}
 
@@ -60,40 +72,40 @@ func (m *ServiceUpdateMonitor) WaitForUpdateComplete(ctx context.Context) error 
 
 			// Log current state
 			if message != "" {
-				log.Printf("[ServiceUpdateMonitor] Service %s update state: %s | Message: %s",
+				m.logf("[ServiceUpdateMonitor] Service %s update state: %s | Message: %s",
 					m.serviceName, state, message)
 			} else {
-				log.Printf("[ServiceUpdateMonitor] Service %s update state: %s",
+				m.logf("[ServiceUpdateMonitor] Service %s update state: %s",
 					m.serviceName, state)
 			}
 
 			// Check terminal states
 			switch state {
 			case swarm.UpdateStateCompleted:
-				log.Printf("[ServiceUpdateMonitor] ✅ Service %s update completed successfully", m.serviceName)
+				m.logf("[ServiceUpdateMonitor] ✅ Service %s update completed successfully", m.serviceName)
 				return nil
 
 			case swarm.UpdateStatePaused:
-				log.Printf("[ServiceUpdateMonitor] ⏸️  Service %s update paused", m.serviceName)
-				return fmt.Errorf("service update paused: %s", message)
+				m.logf("[ServiceUpdateMonitor] ⏸️  Service %s update paused", m.serviceName)
+				return fmt.Errorf("%w: %s", ErrServiceUpdatePaused, message)
 
 			case swarm.UpdateStateRollbackCompleted:
-				log.Printf("[ServiceUpdateMonitor] 🔄 Service %s rollback completed", m.serviceName)
-				return fmt.Errorf("service update rolled back: %s", message)
+				m.logf("[ServiceUpdateMonitor] 🔄 Service %s rollback completed", m.serviceName)
+				return fmt.Errorf("%w: %s", ErrServiceUpdateRolledBack, message)
 
 			case swarm.UpdateStateRollbackPaused:
-				log.Printf("[ServiceUpdateMonitor] ⏸️  Service %s rollback paused", m.serviceName)
-				return fmt.Errorf("service rollback paused: %s", message)
+				m.logf("[ServiceUpdateMonitor] ⏸️  Service %s rollback paused", m.serviceName)
+				return fmt.Errorf("%w: %s", ErrServiceRollbackPaused, message)
 
 			case swarm.UpdateStateUpdating:
 				// Still in progress, continue waiting
-				log.Printf("[ServiceUpdateMonitor] 🔄 Service %s is updating...", m.serviceName)
+				m.logf("[ServiceUpdateMonitor] 🔄 Service %s is updating...", m.serviceName)
 
 			case swarm.UpdateStateRollbackStarted:
-				log.Printf("[ServiceUpdateMonitor] 🔄 Service %s rollback started", m.serviceName)
+				m.logf("[ServiceUpdateMonitor] 🔄 Service %s rollback started", m.serviceName)
 
 			default:
-				log.Printf("[ServiceUpdateMonitor] ⚠️  Service %s unknown update state: %s", m.serviceName, state)
+				m.logf("[ServiceUpdateMonitor] ⚠️  Service %s unknown update state: %s", m.serviceName, state)
 			}
 		}
 	}
@@ -107,4 +119,8 @@ func (m *ServiceUpdateMonitor) GetUpdateStatus(ctx context.Context) (*swarm.Upda
 	}
 
 	return svc.UpdateStatus, nil
+}
+
+func (m *ServiceUpdateMonitor) logf(format string, args ...any) {
+	m.logger.Printf(format, args...)
 }

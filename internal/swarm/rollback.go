@@ -3,7 +3,6 @@ package swarm
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -37,7 +36,7 @@ type StackSnapshot struct {
 
 // CreateSnapshot creates a snapshot of the current stack state
 func (d *StackDeployer) CreateSnapshot(ctx context.Context) (*StackSnapshot, error) {
-	log.Printf("Creating snapshot of stack: %s", d.stackName)
+	d.logf("Creating snapshot of stack: %s", d.stackName)
 
 	services, err := d.GetStackServices(ctx)
 	if err != nil {
@@ -78,7 +77,7 @@ func (d *StackDeployer) CreateSnapshot(ctx context.Context) (*StackSnapshot, err
 			}
 			if retry < maxRetries-1 {
 				waitTime := time.Duration(retry+1) * time.Second
-				log.Printf("failed to list tasks for service %s (attempt %d/%d): %v, retrying in %v",
+				d.logf("failed to list tasks for service %s (attempt %d/%d): %v, retrying in %v",
 					svc.Spec.Name, retry+1, maxRetries, err, waitTime)
 				time.Sleep(waitTime)
 			}
@@ -92,25 +91,25 @@ func (d *StackDeployer) CreateSnapshot(ctx context.Context) (*StackSnapshot, err
 			Tasks:   tasks,
 		}
 		// TODO Debug log
-		// log.Printf("Snapshotted service: %s (version %d)", svc.Spec.Name, svc.Version.Index)
+		// d.logf("Snapshotted service: %s (version %d)", svc.Spec.Name, svc.Version.Index)
 	}
 
-	log.Printf("Snapshot created with %d services", len(snapshot.Services))
+	d.logf("Snapshot created with %d services", len(snapshot.Services))
 	return snapshot, nil
 }
 
 // Rollback restores the stack to a previous snapshot
 func (d *StackDeployer) Rollback(ctx context.Context, snapshot *StackSnapshot) error {
-	log.Printf("Rolling back stack: %s", d.stackName)
+	d.logf("Rolling back stack: %s", d.stackName)
 
 	if snapshot == nil {
-		log.Printf("No snapshot available, skipping rollback")
+		d.logf("No snapshot available, skipping rollback")
 		return nil
 	}
 
 	// If this was first deploy, remove all services
 	if snapshot.IsFirstDeploy {
-		log.Printf("This was first deploy, removing all services")
+		d.logf("This was first deploy, removing all services")
 		return d.removeAllServices(ctx)
 	}
 
@@ -129,11 +128,11 @@ func (d *StackDeployer) Rollback(ctx context.Context, snapshot *StackSnapshot) e
 	// Step 1: Remove new services that didn't exist in snapshot
 	for _, svc := range currentServices {
 		if !snapshot.ExistingIDs[svc.ID] {
-			log.Printf("Removing new service: %s (created during failed deploy)", svc.Spec.Name)
+			d.logf("Removing new service: %s (created during failed deploy)", svc.Spec.Name)
 			if err := d.cli.ServiceRemove(ctx, svc.ID); err != nil {
-				log.Printf("Warning: failed to remove service %s: %v", svc.Spec.Name, err)
+				d.logf("Warning: failed to remove service %s: %v", svc.Spec.Name, err)
 			} else {
-				log.Printf("Successfully removed service: %s", svc.Spec.Name)
+				d.logf("Successfully removed service: %s", svc.Spec.Name)
 			}
 		}
 	}
@@ -146,11 +145,11 @@ func (d *StackDeployer) Rollback(ctx context.Context, snapshot *StackSnapshot) e
 		// Check if service still exists
 		current, exists := currentByID[serviceID]
 		if !exists {
-			log.Printf("Service %s no longer exists, skipping rollback", serviceName)
+			d.logf("Service %s no longer exists, skipping rollback", serviceName)
 			continue
 		}
 
-		log.Printf("Rolling back service: %s to version %d", serviceName, snap.Service.Version.Index)
+		d.logf("Rolling back service: %s to version %d", serviceName, snap.Service.Version.Index)
 
 		// Restore service spec from snapshot
 		rollbackSpec := snap.Service.Spec
@@ -166,7 +165,7 @@ func (d *StackDeployer) Rollback(ctx context.Context, snapshot *StackSnapshot) e
 
 		// If update is paused, log it
 		if current.UpdateStatus != nil && current.UpdateStatus.State == swarm.UpdateStatePaused {
-			log.Printf("Service %s update is paused, will be cleared by rollback update", serviceName)
+			d.logf("Service %s update is paused, will be cleared by rollback update", serviceName)
 		}
 
 		// Update service to previous spec from snapshot
@@ -181,15 +180,15 @@ func (d *StackDeployer) Rollback(ctx context.Context, snapshot *StackSnapshot) e
 		)
 
 		if err != nil {
-			log.Printf("Failed to rollback service %s: %v", serviceName, err)
+			d.logf("Failed to rollback service %s: %v", serviceName, err)
 			return fmt.Errorf("rollback failed for service %s: %w", serviceName, err)
 		}
 
-		log.Printf("Service %s rolled back successfully", serviceName)
+		d.logf("Service %s rolled back successfully", serviceName)
 		updatedServices = append(updatedServices, serviceName)
 	}
 
-	log.Printf("Rollback completed for stack: %s (%d services restored)", d.stackName, len(updatedServices))
+	d.logf("Rollback completed for stack: %s (%d services restored)", d.stackName, len(updatedServices))
 	return nil
 }
 
@@ -201,7 +200,7 @@ func (d *StackDeployer) removeAllServices(ctx context.Context) error {
 	}
 
 	if len(services) == 0 {
-		log.Println("No services to remove")
+		d.logln("No services to remove")
 		return nil
 	}
 
@@ -213,12 +212,12 @@ func (d *StackDeployer) removeAllServices(ctx context.Context) error {
 
 	// Remove all services
 	for _, svc := range services {
-		log.Printf("Removing service: %s", svc.Spec.Name)
+		d.logf("Removing service: %s", svc.Spec.Name)
 		if err := d.cli.ServiceRemove(ctx, svc.ID); err != nil {
-			log.Printf("Warning: failed to remove service %s: %v", svc.Spec.Name, err)
+			d.logf("Warning: failed to remove service %s: %v", svc.Spec.Name, err)
 			delete(removingIDs, svc.ID) // Don't wait for failed removals
 		} else {
-			log.Printf("Initiated removal of service: %s", svc.Spec.Name)
+			d.logf("Initiated removal of service: %s", svc.Spec.Name)
 		}
 	}
 
@@ -227,7 +226,7 @@ func (d *StackDeployer) removeAllServices(ctx context.Context) error {
 	}
 
 	// Wait for services to be actually removed (poll until they're gone)
-	log.Printf("Waiting for %d service(s) to be removed...", len(removingIDs))
+	d.logf("Waiting for %d service(s) to be removed...", len(removingIDs))
 	maxWait := 30 * time.Second
 	pollInterval := 500 * time.Millisecond
 	deadline := time.Now().Add(maxWait)
@@ -239,10 +238,10 @@ func (d *StackDeployer) removeAllServices(ctx context.Context) error {
 			if err != nil {
 				// Service not found = successfully removed
 				if client.IsErrNotFound(err) {
-					log.Printf("✓ Service removed: %s", name)
+					d.logf("✓ Service removed: %s", name)
 					delete(removingIDs, id)
 				} else {
-					log.Printf("Warning: error inspecting service %s: %v", name, err)
+					d.logf("Warning: error inspecting service %s: %v", name, err)
 				}
 			}
 			// If no error, service still exists, keep waiting
@@ -250,7 +249,7 @@ func (d *StackDeployer) removeAllServices(ctx context.Context) error {
 
 		// All services removed?
 		if len(removingIDs) == 0 {
-			log.Println("All services successfully removed")
+			d.logln("All services successfully removed")
 			return nil
 		}
 
@@ -259,9 +258,9 @@ func (d *StackDeployer) removeAllServices(ctx context.Context) error {
 
 	// Timeout reached, report remaining services
 	if len(removingIDs) > 0 {
-		log.Printf("Warning: %d service(s) still removing after %v:", len(removingIDs), maxWait)
+		d.logf("Warning: %d service(s) still removing after %v:", len(removingIDs), maxWait)
 		for _, name := range removingIDs {
-			log.Printf("  - %s", name)
+			d.logf("  - %s", name)
 		}
 	}
 

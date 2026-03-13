@@ -5,18 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"runtime/debug"
 	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
 )
 
 // Monitor monitors a single task's lifecycle, health, and logs
 // It automatically cleans up goroutines when task reaches terminal state
 type Monitor struct {
-	client client.APIClient
+	client DockerClient
+	logger Logger
 
 	// Task identification
 	taskID      string
@@ -53,14 +53,20 @@ type Monitor struct {
 }
 
 // NewMonitor creates a new task monitor
-func NewMonitor(client client.APIClient, taskID string, serviceID string, serviceName string) *Monitor {
-	return NewMonitorWithLogs(client, taskID, serviceID, serviceName, true)
+func NewMonitor(client DockerClient, taskID string, serviceID string, serviceName string) *Monitor {
+	return NewMonitorWithLogsAndLogger(client, taskID, serviceID, serviceName, true, nil)
 }
 
-// NewMonitorWithLogs creates a new task monitor with optional log streaming
-func NewMonitorWithLogs(client client.APIClient, taskID string, serviceID string, serviceName string, showLogs bool) *Monitor {
+// NewMonitorWithLogs creates a new task monitor with optional log streaming.
+func NewMonitorWithLogs(client DockerClient, taskID string, serviceID string, serviceName string, showLogs bool) *Monitor {
+	return NewMonitorWithLogsAndLogger(client, taskID, serviceID, serviceName, showLogs, nil)
+}
+
+// NewMonitorWithLogsAndLogger creates a new task monitor with optional log streaming and custom logger.
+func NewMonitorWithLogsAndLogger(client DockerClient, taskID string, serviceID string, serviceName string, showLogs bool, logger Logger) *Monitor {
 	return &Monitor{
 		client:           client,
+		logger:           withDefaultLogger(logger),
 		taskID:           taskID,
 		serviceID:        serviceID,
 		serviceName:      serviceName,
@@ -80,7 +86,7 @@ func (m *Monitor) Start(ctx context.Context) error {
 	defer close(m.doneChan)
 	defer m.cleanup()
 
-	log.Printf("[TaskMonitor] Started monitoring task %s (service: %s)", m.shortTaskID(), m.serviceName)
+	m.logf("[TaskMonitor] Started monitoring task %s (service: %s)", m.shortTaskID(), m.serviceName)
 
 	// Start goroutines for different monitoring aspects
 	var wg sync.WaitGroup
@@ -99,16 +105,16 @@ func (m *Monitor) Start(ctx context.Context) error {
 	// Wait for completion
 	select {
 	case <-ctx.Done():
-		log.Printf("[TaskMonitor] Context cancelled for task %s", m.shortTaskID())
+		m.logf("[TaskMonitor] Context cancelled for task %s", m.shortTaskID())
 		m.Stop()
 	case <-m.stopChan:
-		log.Printf("[TaskMonitor] Stop signal received for task %s", m.shortTaskID())
+		m.logf("[TaskMonitor] Stop signal received for task %s", m.shortTaskID())
 	}
 
 	// Wait for all goroutines to finish
 	wg.Wait()
 
-	log.Printf("[TaskMonitor] Stopped monitoring task %s", m.shortTaskID())
+	m.logf("[TaskMonitor] Stopped monitoring task %s", m.shortTaskID())
 	return nil
 }
 
@@ -140,7 +146,7 @@ func (m *Monitor) SendEvent(event Event) bool {
 		return false
 	default:
 		// Channel full, log warning
-		log.Printf("[TaskMonitor] WARNING: Event channel full for task %s", m.shortTaskID())
+		m.logf("[TaskMonitor] WARNING: Event channel full for task %s", m.shortTaskID())
 		return false
 	}
 }
@@ -159,7 +165,7 @@ func (m *Monitor) processEvents(ctx context.Context) {
 
 			// If task reached terminal state, stop monitoring
 			if event.IsTerminal() {
-				log.Printf("[TaskMonitor] Task %s reached terminal state: %s",
+				m.logf("[TaskMonitor] Task %s reached terminal state: %s",
 					m.shortTaskID(), event.Type)
 				m.Stop()
 				return
@@ -180,7 +186,7 @@ func (m *Monitor) handleEvent(event Event) {
 	if event.ContainerID != "" && m.containerID == "" {
 		m.containerID = event.ContainerID
 		m.containerOnce.Do(func() { close(m.containerReadyCh) })
-		log.Printf("[TaskMonitor] Got container ID for task %s: %s", m.shortTaskID(), event.ContainerID[:12])
+		m.logf("[TaskMonitor] Got container ID for task %s: %s", m.shortTaskID(), event.ContainerID[:12])
 	}
 
 	// Update health status
@@ -201,19 +207,19 @@ func (m *Monitor) handleEvent(event Event) {
 		if m.containerID != "" {
 			containerInfo = fmt.Sprintf(" (container: %s)", m.containerID[:12])
 		}
-		log.Printf("[TaskMonitor] 🆕 Task %s created%s", m.shortTaskID(), containerInfo)
+		m.logf("[TaskMonitor] 🆕 Task %s created%s", m.shortTaskID(), containerInfo)
 	case EventTypeStarted:
-		log.Printf("[TaskMonitor] ▶️  Task %s started", m.shortTaskID())
+		m.logf("[TaskMonitor] ▶️  Task %s started", m.shortTaskID())
 	case EventTypeHealthy:
-		log.Printf("[TaskMonitor] 💚 Task %s is healthy (checks: %d)",
+		m.logf("[TaskMonitor] 💚 Task %s is healthy (checks: %d)",
 			m.shortTaskID(), m.healthChecks)
 	case EventTypeUnhealthy:
-		log.Printf("[TaskMonitor] 💔 Task %s is unhealthy (failed: %d/%d)",
+		m.logf("[TaskMonitor] 💔 Task %s is unhealthy (failed: %d/%d)",
 			m.shortTaskID(), m.failedChecks, m.healthChecks)
 	case EventTypeFailed:
-		log.Printf("[TaskMonitor] ❌ Task %s failed: %s", m.shortTaskID(), event.Message)
+		m.logf("[TaskMonitor] ❌ Task %s failed: %s", m.shortTaskID(), event.Message)
 	case EventTypeCompleted:
-		log.Printf("[TaskMonitor] 🏁 Task %s completed", m.shortTaskID())
+		m.logf("[TaskMonitor] 🏁 Task %s completed", m.shortTaskID())
 	}
 }
 
@@ -263,20 +269,20 @@ func (m *Monitor) checkHealth(ctx context.Context) {
 func (m *Monitor) streamLogs(ctx context.Context) {
 	// If Docker client is not initialized, skip log streaming
 	if m.client == nil {
-		log.Printf("[TaskLogs] Docker client is nil, skipping log streaming for task %s", m.shortTaskID())
+		m.logf("[TaskLogs] Docker client is nil, skipping log streaming for task %s", m.shortTaskID())
 		return
 	}
 
-	log.Printf("[TaskLogs] Waiting for container ID for task %s...", m.shortTaskID())
+	m.logf("[TaskLogs] Waiting for container ID for task %s...", m.shortTaskID())
 
 	// Block until containerID is set by handleEvent, or until context/stop signal.
 	// containerReadyCh is closed by containerOnce.Do in handleEvent — no polling needed.
 	select {
 	case <-ctx.Done():
-		log.Printf("[TaskLogs] Context done while waiting for container for task %s", m.shortTaskID())
+		m.logf("[TaskLogs] Context done while waiting for container for task %s", m.shortTaskID())
 		return
 	case <-m.stopChan:
-		log.Printf("[TaskLogs] Stop signal while waiting for container for task %s", m.shortTaskID())
+		m.logf("[TaskLogs] Stop signal while waiting for container for task %s", m.shortTaskID())
 		return
 	case <-m.containerReadyCh:
 	}
@@ -286,9 +292,9 @@ func (m *Monitor) streamLogs(ctx context.Context) {
 	state := m.state
 	m.mu.RUnlock()
 
-	log.Printf("[TaskLogs] Container %s for task %s is ready (state: %s)", containerID[:12], m.shortTaskID(), state)
+	m.logf("[TaskLogs] Container %s for task %s is ready (state: %s)", containerID[:12], m.shortTaskID(), state)
 
-	log.Printf("[TaskLogs] About to start streaming logs for %s/%s (container: %s)", m.serviceName, m.shortTaskID(), containerID[:12])
+	m.logf("[TaskLogs] About to start streaming logs for %s/%s (container: %s)", m.serviceName, m.shortTaskID(), containerID[:12])
 
 	// Start streaming logs - get ALL logs, not just from now
 	options := container.LogsOptions{
@@ -301,12 +307,12 @@ func (m *Monitor) streamLogs(ctx context.Context) {
 
 	logReader, err := m.client.ContainerLogs(ctx, containerID, options)
 	if err != nil {
-		log.Printf("[TaskLogs] Failed to stream logs for task %s: %v", m.shortTaskID(), err)
+		m.logf("[TaskLogs] Failed to stream logs for task %s: %v", m.shortTaskID(), err)
 		return
 	}
 	defer logReader.Close()
 
-	log.Printf("[TaskLogs] Successfully opened log stream for %s/%s, starting to read...", m.serviceName, m.shortTaskID())
+	m.logf("[TaskLogs] Successfully opened log stream for %s/%s, starting to read...", m.serviceName, m.shortTaskID())
 
 	// Docker multiplexes stdout/stderr in a special format
 	// Header: [8]byte{STREAM_TYPE, 0, 0, 0, SIZE1, SIZE2, SIZE3, SIZE4}
@@ -329,13 +335,13 @@ func (m *Monitor) streamLogs(ctx context.Context) {
 		n, err := logReader.Read(header)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
-				log.Printf("[TaskLogs] Log stream error for %s: %v", m.shortTaskID(), err)
+				m.logf("[TaskLogs] Log stream error for %s: %v", m.shortTaskID(), err)
 			}
 			return
 		}
 		if n != 8 {
 			if n > 0 {
-				log.Printf("[TaskLogs] Unexpected header size for %s: %d bytes", m.shortTaskID(), n)
+				m.logf("[TaskLogs] Unexpected header size for %s: %d bytes", m.shortTaskID(), n)
 			}
 			continue
 		}
@@ -376,7 +382,7 @@ func (m *Monitor) streamLogs(ctx context.Context) {
 		// Log every 10 lines to show we're receiving data
 		if logsReceived%10 == 1 {
 			//TODO debug log
-			//log.Printf("[TaskLogs] Received %d log lines from %s/%s", logsReceived, m.serviceName, m.shortTaskID())
+			//m.logf("[TaskLogs] Received %d log lines from %s/%s", logsReceived, m.serviceName, m.shortTaskID())
 		}
 	}
 }
@@ -387,7 +393,7 @@ func (m *Monitor) streamLogs(ctx context.Context) {
 // risk a panic if SendEvent is called concurrently and its select picks the closed
 // channel branch over the already-closed stopChan branch.
 func (m *Monitor) cleanup() {
-	log.Printf("[TaskMonitor] Cleaning up monitor for task %s", m.shortTaskID())
+	m.logf("[TaskMonitor] Cleaning up monitor for task %s", m.shortTaskID())
 }
 
 // GetState returns current task state (thread-safe)
@@ -445,14 +451,15 @@ func (m *Monitor) Done() <-chan struct{} {
 // Used to start named goroutines from Start() without anonymous closures.
 func (m *Monitor) runWorker(ctx context.Context, wg *sync.WaitGroup, fn func(context.Context)) {
 	defer wg.Done()
+	defer m.recoverWorkerPanic()
 	fn(ctx)
 }
 
 // runStreamLogs wraps streamLogs with lifecycle logging.
 func (m *Monitor) runStreamLogs(ctx context.Context) {
-	log.Printf("[TaskMonitor] Log streaming goroutine started for task %s", m.shortTaskID())
+	m.logf("[TaskMonitor] Log streaming goroutine started for task %s", m.shortTaskID())
 	m.streamLogs(ctx)
-	log.Printf("[TaskMonitor] Log streaming goroutine ended for task %s", m.shortTaskID())
+	m.logf("[TaskMonitor] Log streaming goroutine ended for task %s", m.shortTaskID())
 }
 
 // shortTaskID returns shortened task ID for logging
@@ -461,4 +468,15 @@ func (m *Monitor) shortTaskID() string {
 		return m.taskID[:12]
 	}
 	return m.taskID
+}
+
+func (m *Monitor) logf(format string, args ...any) {
+	m.logger.Printf(format, args...)
+}
+
+func (m *Monitor) recoverWorkerPanic() {
+	if recovered := recover(); recovered != nil {
+		m.logf("[TaskMonitor] panic recovered for task %s: %v\n%s", m.shortTaskID(), recovered, string(debug.Stack()))
+		m.Stop()
+	}
 }
