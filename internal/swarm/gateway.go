@@ -9,19 +9,19 @@ import (
 	dockerswarm "github.com/docker/docker/api/types/swarm"
 )
 
-// networkInspector — минимальный интерфейс для инспекции сетей Docker.
+// networkInspector is a minimal interface for Docker network inspection.
 type networkInspector interface {
 	NetworkInspect(ctx context.Context, networkID string, options network.InspectOptions) (network.Inspect, error)
 }
 
-// nodeCounter — минимальный интерфейс для получения списка узлов Swarm.
+// nodeCounter is a minimal interface for listing Swarm nodes.
 type nodeCounter interface {
 	NodeList(ctx context.Context, options dockerswarm.NodeListOptions) ([]dockerswarm.Node, error)
 }
 
-// DetectHostGatewayIP возвращает IP-адрес шлюза Docker-хоста,
-// инспектируя IPAM-конфиг сети "bridge" (docker0).
-// Это то же значение, которое Docker Compose использует для "host-gateway".
+// DetectHostGatewayIP returns the Docker host gateway IP by inspecting
+// the IPAM config of the "bridge" (docker0) network.
+// This is the same value Docker Compose resolves for the "host-gateway" special token.
 func DetectHostGatewayIP(ctx context.Context, cli networkInspector) (string, error) {
 	inspect, err := cli.NetworkInspect(ctx, "bridge", network.InspectOptions{})
 	if err != nil {
@@ -35,7 +35,7 @@ func DetectHostGatewayIP(ctx context.Context, cli networkInspector) (string, err
 	return "", fmt.Errorf("cannot resolve host-gateway: no gateway found in bridge network IPAM config")
 }
 
-// IsMultiNodeSwarm возвращает true если кластер Swarm содержит более одного узла.
+// IsMultiNodeSwarm returns true if the Swarm cluster contains more than one node.
 func IsMultiNodeSwarm(ctx context.Context, cli nodeCounter) (bool, error) {
 	nodes, err := cli.NodeList(ctx, dockerswarm.NodeListOptions{})
 	if err != nil {
@@ -44,7 +44,7 @@ func IsMultiNodeSwarm(ctx context.Context, cli nodeCounter) (bool, error) {
 	return len(nodes) > 1, nil
 }
 
-// hasHostGateway возвращает true если хотя бы одна запись в hosts содержит "host-gateway".
+// hasHostGateway returns true if at least one entry in hosts contains the "host-gateway" token.
 func hasHostGateway(hosts []string) bool {
 	for _, h := range hosts {
 		if strings.Contains(h, "host-gateway") {

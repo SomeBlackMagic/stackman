@@ -13,9 +13,9 @@ import (
 	"github.com/SomeBlackMagic/stackman/internal/compose"
 )
 
-// resolveServiceExtraHosts выполняет разрешение "host-gateway" в extra_hosts.
-// Для одноузлового Swarm: автоматически определяет IP шлюза docker0.
-// Для многоузлового Swarm: возвращает ошибку — IP некорректен для worker-узлов.
+// resolveServiceExtraHosts resolves the "host-gateway" token in extra_hosts entries.
+// On a single-node Swarm: auto-detects the docker0 bridge gateway IP.
+// On a multi-node Swarm: returns an error because the manager IP would be wrong for worker nodes.
 func (d *StackDeployer) resolveServiceExtraHosts(ctx context.Context, serviceName string, service *compose.Service) error {
 	if !hasHostGateway(service.ExtraHosts) {
 		return nil
@@ -71,7 +71,7 @@ func (d *StackDeployer) deployServices(ctx context.Context, services map[string]
 func (d *StackDeployer) deployService(ctx context.Context, serviceName string, service *compose.Service, deployID string) (*ServiceUpdateResult, error) {
 	fullName := fmt.Sprintf("%s_%s", d.stackName, serviceName)
 
-	// Resolve host-gateway in extra_hosts before conversion
+	// Resolve host-gateway token in extra_hosts before converting to Swarm spec
 	if err := d.resolveServiceExtraHosts(ctx, serviceName, service); err != nil {
 		return nil, err
 	}
