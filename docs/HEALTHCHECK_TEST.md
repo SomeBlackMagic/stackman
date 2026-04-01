@@ -153,3 +153,82 @@ Health checking happens in two stages:
 - `cmd/apply.go` - Main health check logic
 - `internal/health/service_update_monitor.go` - Service update monitoring
 - `testdata/simple-stack.yml` - Integration test stack with healthchecks
+
+---
+
+## Stackman и Docker API: управление Swarm как Helm управляет Kubernetes
+
+### Концепция
+
+Stackman управляет Docker Swarm-стеками через **Docker Engine API** — точно так же, как Helm управляет ресурсами Kubernetes через Kubernetes API.
+
+```
+Helm        →  values.yaml + Chart   →  Kubernetes API  →  Pods/Services/Deployments
+Stackman    →  docker-compose.yml    →  Docker API       →  Swarm Services/Tasks/Containers
+```
+
+Оба инструмента реализуют **декларативную модель**: пользователь описывает желаемое состояние в файле конфигурации, а инструмент сам вычисляет разницу с текущим состоянием и применяет изменения через API.
+
+### Как stackman использует Docker API
+
+Вся работа со Swarm происходит через интерфейс `DockerClient` (`internal/swarm/interface.go`), который оборачивает Docker Engine HTTP API:
+
+| Docker API вызов | Аналог kubectl/Helm | Назначение |
+|---|---|---|
+| `ServiceCreate` | `kubectl create deployment` | Создание нового сервиса |
+| `ServiceUpdate` | `kubectl set image` / `helm upgrade` | Обновление существующего сервиса |
+| `ServiceInspect` | `kubectl get deployment -o yaml` | Получение текущего состояния сервиса |
+| `ServiceList` | `kubectl get deployments` | Список всех сервисов стека |
+| `ServiceRemove` | `kubectl delete deployment` | Удаление сервиса |
+| `TaskList` | `kubectl get pods` | Список запущенных задач (аналог Pods) |
+| `ContainerInspect` | `kubectl describe pod` | Детальный статус контейнера и healthcheck |
+| `NetworkCreate` / `NetworkRemove` | `kubectl apply -f network.yaml` | Управление overlay-сетями |
+| `VolumeCreate` | `kubectl apply -f pvc.yaml` | Управление томами |
+
+### Декларативный цикл управления
+
+```
+docker-compose.yml (желаемое состояние)
+        │
+        ▼
+┌─────────────────────────────────┐
+│  stackman apply                  │
+│                                  │
+│  1. Парсинг compose-файла        │  ← internal/compose
+│  2. Снимок текущего состояния    │  ← internal/snapshot
+│  3. Вычисление изменений (plan)  │  ← internal/plan
+│  4. Применение через Docker API  │  ← internal/swarm
+│  5. Ожидание сходимости          │  ← internal/health
+└─────────────────────────────────┘
+        │
+        ▼
+Docker Swarm (фактическое состояние)
+  Services → Tasks → Containers
+```
+
+### Сравнение с Helm
+
+| Возможность | Helm (Kubernetes) | Stackman (Docker Swarm) |
+|---|---|---|
+| Декларативный деплой | `helm install/upgrade` | `stackman apply` |
+| Откат | `helm rollback` | `stackman rollback` (snapshot-based) |
+| Ожидание готовности | `--wait` флаг | встроено по умолчанию |
+| Healthcheck | Kubernetes readiness/liveness probes | Docker HEALTHCHECK |
+| История релизов | Хранится в Secrets кластера | Snapshot в памяти (в процессе) |
+| Шаблонизация | Go templates + values.yaml | В разработке (`--values` флаг) |
+| Dry-run / diff | `helm diff` (plugin) | `internal/plan` (в разработке) |
+
+### Механизм ожидания сходимости (convergence)
+
+Это ключевое отличие от простого `docker stack deploy`. Stackman **ждёт**, пока Swarm фактически достигнет желаемого состояния:
+
+```
+docker stack deploy   →  отправил задание → вышел
+stackman apply        →  отправил задание → ждёт сходимости → вышел с результатом
+```
+
+Сходимость определяется через два последовательных этапа (см. секцию [Implementation Details](#implementation-details) выше):
+1. Swarm-оркестратор завершил rolling update сервиса
+2. Все контейнеры нового поколения прошли healthcheck
+
+Такой подход позволяет встраивать `stackman apply` в CI/CD пайплайны: ненулевой код возврата означает реальный сбой деплоя, а не просто ошибку отправки задания в Swarm.
