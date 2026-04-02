@@ -27,6 +27,14 @@ import (
 	"github.com/SomeBlackMagic/stackman/internal/swarm"
 )
 
+// healthClient defines the Docker API methods required by waitForAllTasksHealthy.
+// Using an interface allows unit testing without a real Docker daemon.
+type healthClient interface {
+	ServiceList(ctx context.Context, options types.ServiceListOptions) ([]dockerswarm.Service, error)
+	TaskList(ctx context.Context, options types.TaskListOptions) ([]dockerswarm.Task, error)
+	ContainerInspect(ctx context.Context, containerID string) (types.ContainerJSON, error)
+}
+
 // ExecuteApply runs the apply command
 func ExecuteApply(args []string) {
 	fs := flag.NewFlagSet("apply", flag.ExitOnError)
@@ -149,7 +157,7 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 	signalWG.Add(1)
 	go func() {
 		defer signalWG.Done()
-		runSignalHandler(ctx, sigChan, deploymentComplete, snap, stackDeployer, opts.RollbackTimeout, cancel, signalErrCh)
+		runSignalHandler(ctx, sigChan, deploymentComplete, cancel, signalErrCh)
 	}()
 	defer signalWG.Wait()
 
@@ -224,11 +232,14 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 	if err := updateGroup.Wait(); err != nil {
 		updateCancel()
 		_ = watchersGroup.Wait()
+		rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), opts.RollbackTimeout)
+		defer rollbackCancel()
 		if signalErr := tryGetSignalError(signalErrCh); signalErr != nil {
+			snapshot.Rollback(rollbackCtx, stackDeployer, snap)
 			return signalErr
 		}
 		log.Printf("ERROR: %v", err)
-		snapshot.Rollback(ctx, stackDeployer, snap)
+		snapshot.Rollback(rollbackCtx, stackDeployer, snap)
 		return err
 	}
 
@@ -246,11 +257,14 @@ func runApply(stackName, composeFile string, opts *ApplyOptions) error {
 	if err := waitForAllTasksHealthy(healthCtx, cli, stackName, deployResult.UpdatedServices, deployResult.DeployID, inspectParallelism); err != nil {
 		updateCancel()
 		_ = watchersGroup.Wait()
+		rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), opts.RollbackTimeout)
+		defer rollbackCancel()
 		if signalErr := tryGetSignalError(signalErrCh); signalErr != nil {
+			snapshot.Rollback(rollbackCtx, stackDeployer, snap)
 			return signalErr
 		}
 		log.Printf("ERROR: %v", err)
-		snapshot.Rollback(ctx, stackDeployer, snap)
+		snapshot.Rollback(rollbackCtx, stackDeployer, snap)
 		return err
 	}
 
@@ -349,7 +363,7 @@ func monitorServiceTasks(ctx context.Context, cli *client.Client, svc swarm.Serv
 
 // waitForAllTasksHealthy waits for all tasks of updated services to become healthy.
 // Optimized to use batch API calls instead of per-service calls.
-func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName string, updatedServices []swarm.ServiceUpdateResult, deployID string, inspectParallelism int) error {
+func waitForAllTasksHealthy(ctx context.Context, cli healthClient, stackName string, updatedServices []swarm.ServiceUpdateResult, deployID string, inspectParallelism int) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -391,6 +405,15 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 				continue
 			}
 
+			// Build a reverse index from Docker service ID to service name.
+			// com.docker.swarm.service.name is NOT present in task.Spec.ContainerSpec.Labels —
+			// Docker Swarm only puts it in task.Labels (managed by the orchestrator).
+			// Grouping by ContainerSpec label was the root cause of Bug 1.
+			serviceIDToName := make(map[string]string, len(updatedServices))
+			for _, svc := range updatedServices {
+				serviceIDToName[svc.ServiceID] = svc.ServiceName
+			}
+
 			// Group tasks by service name and filter by deployID.
 			tasksByService := make(map[string][]dockerswarm.Task)
 			for _, task := range allStackTasks {
@@ -401,7 +424,10 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 				if !ok || taskDeployID != deployID {
 					continue
 				}
-				serviceName := task.Spec.ContainerSpec.Labels["com.docker.swarm.service.name"]
+				serviceName, ok := serviceIDToName[task.ServiceID]
+				if !ok {
+					continue
+				}
 				tasksByService[serviceName] = append(tasksByService[serviceName], task)
 			}
 
@@ -422,7 +448,7 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 					if t.Status.State == dockerswarm.TaskStateFailed ||
 						t.Status.State == dockerswarm.TaskStateShutdown ||
 						t.Status.State == dockerswarm.TaskStateRejected {
-						log.Printf("[HealthCheck] ⚠️  Task %s (%s) is %s: %s (waiting for restart)", t.ID[:12], svc.ServiceName, t.Status.State, t.Status.Message)
+						log.Printf("[HealthCheck] ⚠️  Task %s (%s) is %s: %s (waiting for restart)", shortTaskID(t.ID), svc.ServiceName, t.Status.State, t.Status.Message)
 						continue
 					}
 
@@ -433,8 +459,8 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 
 					if t.Status.State != dockerswarm.TaskStateRunning {
 						allHealthy = false
-						unhealthyTasks = append(unhealthyTasks, fmt.Sprintf("%s/%s (state: %s)", svc.ServiceName, t.ID[:12], t.Status.State))
-						log.Printf("[HealthCheck] ⏳ Task %s (%s) is %s", t.ID[:12], svc.ServiceName, t.Status.State)
+						unhealthyTasks = append(unhealthyTasks, fmt.Sprintf("%s/%s (state: %s)", svc.ServiceName, shortTaskID(t.ID), t.Status.State))
+						log.Printf("[HealthCheck] ⏳ Task %s (%s) is %s", shortTaskID(t.ID), svc.ServiceName, t.Status.State)
 						continue
 					}
 
@@ -446,8 +472,8 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 						})
 					} else {
 						allHealthy = false
-						unhealthyTasks = append(unhealthyTasks, fmt.Sprintf("%s/%s (no container)", svc.ServiceName, t.ID[:12]))
-						log.Printf("[HealthCheck] ⏳ Task %s (%s) has no container yet", t.ID[:12], svc.ServiceName)
+						unhealthyTasks = append(unhealthyTasks, fmt.Sprintf("%s/%s (no container)", svc.ServiceName, shortTaskID(t.ID)))
+						log.Printf("[HealthCheck] ⏳ Task %s (%s) has no container yet", shortTaskID(t.ID), svc.ServiceName)
 					}
 				}
 
@@ -482,23 +508,23 @@ func waitForAllTasksHealthy(ctx context.Context, cli *client.Client, stackName s
 				serviceName := ct.serviceName
 
 				if result.err != nil {
-					log.Printf("[HealthCheck] Failed to inspect container %s for task %s (%s): %v", ct.containerID[:12], taskID[:12], serviceName, result.err)
+					log.Printf("[HealthCheck] Failed to inspect container %s for task %s (%s): %v", shortTaskID(ct.containerID), shortTaskID(taskID), serviceName, result.err)
 					allHealthy = false
-					unhealthyTasks = append(unhealthyTasks, fmt.Sprintf("%s/%s (inspect failed)", serviceName, taskID[:12]))
+					unhealthyTasks = append(unhealthyTasks, fmt.Sprintf("%s/%s (inspect failed)", serviceName, shortTaskID(taskID)))
 					continue
 				}
 
 				if result.info.State.Health != nil {
 					if result.info.State.Health.Status != container.Healthy {
 						allHealthy = false
-						unhealthyTasks = append(unhealthyTasks, fmt.Sprintf("%s/%s (health: %s)", serviceName, taskID[:12], result.info.State.Health.Status))
-						log.Printf("[HealthCheck] ⏳ Task %s (%s) is %s", taskID[:12], serviceName, result.info.State.Health.Status)
+						unhealthyTasks = append(unhealthyTasks, fmt.Sprintf("%s/%s (health: %s)", serviceName, shortTaskID(taskID), result.info.State.Health.Status))
+						log.Printf("[HealthCheck] ⏳ Task %s (%s) is %s", shortTaskID(taskID), serviceName, result.info.State.Health.Status)
 					} else {
-						log.Printf("[HealthCheck] ✅ Task %s (%s) is healthy", taskID[:12], serviceName)
+						log.Printf("[HealthCheck] ✅ Task %s (%s) is healthy", shortTaskID(taskID), serviceName)
 						serviceHealthyCount[serviceName]++
 					}
 				} else {
-					log.Printf("[HealthCheck] ✅ Task %s (%s) is running (no healthcheck)", taskID[:12], serviceName)
+					log.Printf("[HealthCheck] ✅ Task %s (%s) is running (no healthcheck)", shortTaskID(taskID), serviceName)
 					serviceHealthyCount[serviceName]++
 				}
 			}
@@ -534,14 +560,15 @@ type inspectResult struct {
 	err  error
 }
 
-// runSignalHandler waits for an OS signal, performs rollback and cancels the main context.
+// runSignalHandler waits for an OS signal and notifies the main goroutine via errCh.
+// Rollback is performed by the main goroutine — this keeps rollback in a single place
+// and eliminates the race condition where both signal handler and health-check timeout
+// could trigger concurrent rollbacks.
+// Error is sent to errCh BEFORE cancel() so that tryGetSignalError reliably catches it.
 func runSignalHandler(
 	ctx context.Context,
 	sigChan <-chan os.Signal,
 	deploymentComplete <-chan struct{},
-	snap *swarm.StackSnapshot,
-	deployer *swarm.StackDeployer,
-	rollbackTimeout time.Duration,
 	cancel context.CancelFunc,
 	errCh chan<- error,
 ) {
@@ -555,12 +582,8 @@ func runSignalHandler(
 	case sig := <-sigChan:
 		log.Printf("Received signal: %v", sig)
 		log.Println("Deployment interrupted, initiating rollback...")
-		cancel()
-
-		rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), rollbackTimeout)
-		defer rollbackCancel()
-		snapshot.Rollback(rollbackCtx, deployer, snap)
 		nonBlockingSendError(errCh, fmt.Errorf("deployment interrupted by signal %v", sig))
+		cancel()
 	}
 }
 
