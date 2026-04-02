@@ -1,62 +1,25 @@
-# syntax=docker/dockerfile:1.8
-# check=error=true
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
 
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS build
-
-ENV CGO_ENABLED=0 \
-    GOMODCACHE=/go/pkg/mod \
-    GOCACHE=/root/.cache/go-build \
-    GOTOOLCHAIN=local \
-    TZ=UTC \
-    SOURCE_DATE_EPOCH=0
-
-WORKDIR /workspace
-
-# warm up module cache
-COPY go.mod go.sum ./
-RUN \
-    --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod download
-
-# copy sources
-COPY . .
-
-
-# target parameters for cross-compilation
 ARG TARGETOS
 ARG TARGETARCH
-ARG VERSION
-ARG REVISION
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
 
-# build the binary
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    GOOS=${TARGETOS:-$(go env GOOS)} \
-    GOARCH=${TARGETARCH:-$(go env GOARCH)} \
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build \
-      -v \
-      -o /workspace/stackman \
-      -trimpath \
-      -mod=readonly \
-      -buildvcs=false \
-      -tags netgo,osusergo,timetzdata \
-      -pgo=auto \
-      -ldflags "-s -w -buildid= \
-                -extldflags '-static' \
-                -X 'main.version=${VERSION}' \
-                -X 'main.revision=${REVISION}'" \
-      .
+    -ldflags "-X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE} -s -w" \
+    -o stackman .
 
-# minimal runtime image
-FROM busybox
+FROM --platform=$BUILDPLATFORM alpine:3.19 AS certs
+RUN apk add --no-cache ca-certificates
 
-COPY --from=curlimages/curl:8.7.1 /usr/bin/curl /usr/bin/curl
-
-# copy the binary (read/execute permissions are enough)
-COPY --from=build --chmod=0555 /workspace/stackman /usr/local/bin/stackman
-
-# run as non-root (65532 = nobody in most base images)
-USER 65532:65532
-
-CMD ["/usr/local/bin/stackman"]
+FROM alpine:3.19
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /app/stackman /usr/local/bin/stackman
+ENTRYPOINT ["stackman"]

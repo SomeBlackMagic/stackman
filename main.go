@@ -1,9 +1,13 @@
 package main
 
-import (
-	"github.com/SomeBlackMagic/stackman/cmd"
+import "fmt"
+
+var (
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildDate = "unknown"
 )
 
 func main() {
-	cmd.Execute()
+	fmt.Println("stackman")
 }
