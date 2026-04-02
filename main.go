@@ -1,6 +1,6 @@
 package main
 
-import "fmt"
+import "github.com/SomeBlackMagic/stackman/cmd"
 
 var (
 	Version   = "dev"
@@ -8,6 +8,12 @@ var (
 	BuildDate = "unknown"
 )
 
+func init() {
+	cmd.Version = Version
+	cmd.Commit = Commit
+	cmd.BuildDate = BuildDate
+}
+
 func main() {
-	fmt.Println("stackman")
+	cmd.Execute()
 }
